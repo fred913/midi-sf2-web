@@ -4,6 +4,11 @@ const DEFAULT_OUTPUT_ID = "generaluser-gs-web-audio";
 const MIDI_CHANNELS = 16;
 const PERCUSSION_CHANNEL = 9;
 const DEFAULT_PITCH_BEND_RANGE = 2;
+const DEFAULT_LOOKAHEAD_MS = 120;
+const DEFAULT_SCHEDULER_INTERVAL_MS = 25;
+const GM_SYSTEM_ON = [0xf0, 0x7e, null, 0x09, 0x01, 0xf7];
+const GM2_SYSTEM_ON = [0xf0, 0x7e, null, 0x09, 0x03, 0xf7];
+const GS_RESET_PREFIX = [0xf0, 0x41, null, 0x42, 0x12, 0x40, 0x00, 0x7f, 0x00];
 const UINT16_REPLACE_OPERATORS = new Set([41, 46, 47, 53, 54, 56, 57, 58]);
 const ADDITIVE_OPERATORS = new Set([
   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17,
@@ -59,25 +64,50 @@ export function installWebMidiAudioShim(options = {}) {
     return installedShim;
   }
 
+  if (installedShim && options.force) {
+    installedShim.restore();
+  }
+
   const previousRequestMIDIAccess = targetNavigator.requestMIDIAccess;
   const synth = new EmbeddedSoundFontSynth({
     audioContext: options.audioContext,
     soundFontBase64: options.soundFontBase64 || embeddedSoundFontBase64,
     masterGain: options.masterGain
   });
-  const access = new VirtualMIDIAccess(synth, options);
+  const accessBySysex = new Map();
 
-  function requestMIDIAccess() {
-    return Promise.resolve(access);
+  function getAccess(requestOptions = {}) {
+    const sysexEnabled = !!requestOptions.sysex;
+    if (!accessBySysex.has(sysexEnabled)) {
+      accessBySysex.set(sysexEnabled, new VirtualMIDIAccess(synth, {
+        ...options,
+        sysexEnabled,
+        lookaheadMs: options.lookaheadMs ?? DEFAULT_LOOKAHEAD_MS,
+        schedulerIntervalMs: options.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS
+      }));
+    }
+    return accessBySysex.get(sysexEnabled);
+  }
+
+  function requestMIDIAccess(requestOptions = {}) {
+    return Promise.resolve(getAccess(requestOptions));
   }
 
   defineRequestMIDIAccess(targetNavigator, requestMIDIAccess);
 
   installedShim = {
-    access,
+    get access() {
+      return getAccess();
+    },
+    getAccess,
     synth,
     previousRequestMIDIAccess,
     restore() {
+      for (const access of accessBySysex.values()) {
+        for (const output of access.outputs.values()) {
+          output.clear();
+        }
+      }
       if (previousRequestMIDIAccess) {
         defineRequestMIDIAccess(targetNavigator, previousRequestMIDIAccess);
       } else {
@@ -105,27 +135,48 @@ export async function preloadEmbeddedSoundFont() {
 
 export async function playMidiFile(arrayBuffer, options = {}) {
   const events = parseMidiFile(arrayBuffer);
-  const access = options.access || installedShim?.access || await navigator.requestMIDIAccess();
+  const access = options.access || installedShim?.getAccess?.({ sysex: true }) || await navigator.requestMIDIAccess({ sysex: true });
   const output = options.output || firstMapValue(access.outputs);
   if (!output) {
     throw new Error("No MIDI output is available.");
   }
 
   const playbackRate = options.playbackRate || 1;
-  const timers = [];
-  const startedAt = performanceNow();
-  for (const event of events) {
-    const delay = Math.max(0, event.timeMs / playbackRate);
-    timers.push(globalThis.setTimeout(() => output.send(event.data), delay));
-  }
+  const lookaheadMs = options.lookaheadMs ?? DEFAULT_LOOKAHEAD_MS;
+  const schedulerIntervalMs = options.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS;
+  const startedAt = performanceNow() + (options.startDelayMs || 0);
+  let cursor = 0;
+  let stopped = false;
+  const scheduler = new LookaheadScheduler({
+    intervalMs: schedulerIntervalMs,
+    onTick() {
+      if (stopped) {
+        return;
+      }
+      const horizon = performanceNow() + lookaheadMs;
+      while (cursor < events.length) {
+        const eventTimestamp = startedAt + events[cursor].timeMs / playbackRate;
+        if (eventTimestamp > horizon) {
+          break;
+        }
+        output.send(events[cursor].data, eventTimestamp);
+        cursor += 1;
+      }
+      if (cursor >= events.length) {
+        scheduler.stop();
+      }
+    }
+  });
+
+  scheduler.start();
+  scheduler.tick();
 
   return {
     durationMs: events.length ? events[events.length - 1].timeMs / playbackRate : 0,
     startedAt,
     stop() {
-      for (const timer of timers) {
-        globalThis.clearTimeout(timer);
-      }
+      stopped = true;
+      scheduler.stop();
       if (typeof output.clear === "function") {
         output.clear();
       }
@@ -227,7 +278,12 @@ export function parseMidiFile(arrayBuffer) {
 
       if (status === 0xf0 || status === 0xf7) {
         const length = readVarLen(track);
-        track.offset += length;
+        const data = [status];
+        for (let i = 0; i < length; i += 1) {
+          data.push(view.getUint8(track.offset));
+          track.offset += 1;
+        }
+        rawEvents.push({ tick: track.tick, data });
         continue;
       }
 
@@ -293,10 +349,22 @@ class SimpleEventTarget {
   }
 
   dispatchEvent(event) {
+    if (!event || !event.type) {
+      throw new TypeError("Event object requires a type.");
+    }
+    if (event.timeStamp == null) {
+      event.timeStamp = performanceNow();
+    }
+    event.target = this;
+    event.currentTarget = this;
     const listeners = this.listeners.get(event.type);
     if (listeners) {
       for (const listener of listeners) {
-        listener.call(this, event);
+        if (typeof listener === "function") {
+          listener.call(this, event);
+        } else if (listener && typeof listener.handleEvent === "function") {
+          listener.handleEvent(event);
+        }
       }
     }
     const handler = this[`on${event.type}`];
@@ -310,16 +378,24 @@ class SimpleEventTarget {
 class VirtualMIDIAccess extends SimpleEventTarget {
   constructor(synth, options) {
     super();
-    this.sysexEnabled = false;
+    this.sysexEnabled = !!options.sysexEnabled;
     this.inputs = new Map();
     this.outputs = new Map();
 
     const output = new VirtualMIDIOutput(synth, {
+      access: this,
       id: options.outputId || DEFAULT_OUTPUT_ID,
       manufacturer: options.manufacturer || "midi-sf2-web",
-      name: options.outputName || "GeneralUser GS Web Audio"
+      name: options.outputName || "GeneralUser GS Web Audio",
+      sysexEnabled: this.sysexEnabled,
+      lookaheadMs: options.lookaheadMs ?? DEFAULT_LOOKAHEAD_MS,
+      schedulerIntervalMs: options.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS
     });
     this.outputs.set(output.id, output);
+  }
+
+  emitPortStateChange(port) {
+    this.dispatchEvent(createMIDIConnectionEvent(port));
   }
 }
 
@@ -327,6 +403,7 @@ class VirtualMIDIOutput extends SimpleEventTarget {
   constructor(synth, options) {
     super();
     this.synth = synth;
+    this.access = options.access;
     this.id = options.id;
     this.manufacturer = options.manufacturer;
     this.name = options.name;
@@ -334,35 +411,131 @@ class VirtualMIDIOutput extends SimpleEventTarget {
     this.version = "0.1.0";
     this.state = "connected";
     this.connection = "closed";
+    this.sysexEnabled = !!options.sysexEnabled;
+    this.lookaheadMs = options.lookaheadMs ?? DEFAULT_LOOKAHEAD_MS;
+    this.queue = [];
+    this.queueSequence = 0;
+    this.scheduler = new LookaheadScheduler({
+      intervalMs: options.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS,
+      onTick: () => this.flushQueue()
+    });
   }
 
   open() {
-    this.connection = "open";
-    this.dispatchEvent({ type: "statechange", port: this });
+    if (this.state === "disconnected") {
+      this.connection = "pending";
+      this.emitStateChange();
+      return Promise.resolve(this);
+    }
+    if (this.connection !== "open") {
+      this.connection = "open";
+      this.emitStateChange();
+    }
     return Promise.resolve(this);
   }
 
   close() {
-    this.connection = "closed";
-    this.dispatchEvent({ type: "statechange", port: this });
+    if (this.connection !== "closed") {
+      this.queue.length = 0;
+      this.scheduler.stop();
+      this.connection = "closed";
+      this.emitStateChange();
+    }
     return Promise.resolve(this);
   }
 
-  send(data, timestamp) {
-    if (this.connection === "closed") {
-      this.connection = "open";
+  send(data, timestamp = 0) {
+    if (this.state === "disconnected") {
+      throw createDOMException("InvalidStateError", "Cannot send to a disconnected MIDI output.");
     }
-    const bytes = Array.from(data);
-    const delaySeconds = timestamp ? Math.max(0, (timestamp - performanceNow()) / 1000) : 0;
-    this.synth.dispatchMidi(bytes, delaySeconds);
+
+    const messages = parseMIDIMessageSequence(data, this.sysexEnabled);
+    const timestampNumber = Number(timestamp || 0);
+    if (!Number.isFinite(timestampNumber) || timestampNumber < 0) {
+      throw new TypeError("MIDIOutput.send() timestamp must be a finite non-negative number.");
+    }
+
+    if (this.connection === "closed") {
+      this.open();
+    }
+
+    const now = performanceNow();
+    const sendTimestamp = timestampNumber > now ? timestampNumber : now;
+    for (const message of messages) {
+      this.queue.push({
+        bytes: message,
+        timestamp: sendTimestamp,
+        sequence: this.queueSequence
+      });
+      this.queueSequence += 1;
+    }
+    this.queue.sort((a, b) => a.timestamp - b.timestamp || a.sequence - b.sequence);
+    this.flushQueue();
   }
 
   clear() {
+    this.queue.length = 0;
+    this.scheduler.stop();
     this.synth.allSoundOff();
   }
 
   preload() {
     return this.synth.preload();
+  }
+
+  flushQueue() {
+    if (!this.queue.length) {
+      this.scheduler.stop();
+      return;
+    }
+
+    const now = performanceNow();
+    const horizon = now + this.lookaheadMs;
+    while (this.queue.length && this.queue[0].timestamp <= horizon) {
+      const item = this.queue.shift();
+      const delaySeconds = Math.max(0, (item.timestamp - now) / 1000);
+      this.synth.dispatchMidi(item.bytes, delaySeconds);
+    }
+
+    if (this.queue.length) {
+      this.scheduler.start();
+    } else {
+      this.scheduler.stop();
+    }
+  }
+
+  emitStateChange() {
+    this.dispatchEvent(createMIDIConnectionEvent(this));
+    if (this.access) {
+      this.access.emitPortStateChange(this);
+    }
+  }
+}
+
+class LookaheadScheduler {
+  constructor(options) {
+    this.intervalMs = options.intervalMs;
+    this.onTick = options.onTick;
+    this.timer = null;
+  }
+
+  start() {
+    if (this.timer != null) {
+      return;
+    }
+    this.timer = globalThis.setInterval(() => this.tick(), this.intervalMs);
+  }
+
+  stop() {
+    if (this.timer == null) {
+      return;
+    }
+    globalThis.clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  tick() {
+    this.onTick();
   }
 }
 
@@ -393,6 +566,7 @@ class EmbeddedSoundFontSynth {
 
     const status = bytes[0];
     if (status >= 0xf0) {
+      this.dispatchSystemMessage(bytes, delaySeconds);
       return;
     }
 
@@ -412,11 +586,17 @@ class EmbeddedSoundFontSynth {
           this.noteOn(channelIndex, data1, data2, delaySeconds);
         }
         break;
+      case 0xa0:
+        this.polyAftertouch(channelIndex, data1, data2, delaySeconds);
+        break;
       case 0xb0:
         this.controlChange(channelIndex, data1, data2, delaySeconds);
         break;
       case 0xc0:
         this.channels[channelIndex].program = data1 & 0x7f;
+        break;
+      case 0xd0:
+        this.channelAftertouch(channelIndex, data1, delaySeconds);
         break;
       case 0xe0:
         this.channels[channelIndex].pitchBend = ((data2 << 7) | data1) - 8192;
@@ -424,6 +604,31 @@ class EmbeddedSoundFontSynth {
         break;
       default:
         break;
+    }
+  }
+
+  dispatchSystemMessage(bytes, delaySeconds = 0) {
+    const status = bytes[0];
+    if (status === 0xf0) {
+      if (matchesSysex(bytes, GM_SYSTEM_ON) || matchesSysex(bytes, GM2_SYSTEM_ON) || isGsReset(bytes)) {
+        this.resetSystem(delaySeconds);
+      }
+      return;
+    }
+
+    if (status === 0xff) {
+      this.resetSystem(delaySeconds);
+    }
+  }
+
+  resetSystem(delaySeconds = 0) {
+    this.allSoundOff();
+    for (let i = 0; i < this.channels.length; i += 1) {
+      const existingNotes = this.channels[i].activeNotes;
+      const existingVoices = this.channels[i].activeVoices;
+      this.channels[i] = createChannelState(i);
+      existingNotes.clear();
+      existingVoices.clear();
     }
   }
 
@@ -443,6 +648,11 @@ class EmbeddedSoundFontSynth {
     }
 
     const startTime = context.currentTime + delaySeconds;
+    const exclusiveClasses = new Set(regions.map((region) => region.exclusiveClass || 0).filter(Boolean));
+    for (const exclusiveClass of exclusiveClasses) {
+      this.releaseExclusiveClass(channel, exclusiveClass, startTime);
+    }
+
     const voices = [];
     for (const region of regions) {
       const voice = this.createVoice(context, channel, channelIndex, note, velocity, region, startTime);
@@ -458,6 +668,9 @@ class EmbeddedSoundFontSynth {
     const activeForNote = channel.activeNotes.get(note) || [];
     activeForNote.push(...voices);
     channel.activeNotes.set(note, activeForNote);
+    for (const voice of voices) {
+      channel.activeVoices.add(voice);
+    }
   }
 
   noteOff(channelIndex, note, delaySeconds = 0) {
@@ -482,51 +695,174 @@ class EmbeddedSoundFontSynth {
     channel.activeNotes.delete(note);
   }
 
+  polyAftertouch(channelIndex, note, value, delaySeconds = 0) {
+    const channel = this.channels[channelIndex];
+    channel.polyPressure.set(note, value & 0x7f);
+    this.updateChannelGain(channelIndex, delaySeconds);
+  }
+
+  channelAftertouch(channelIndex, value, delaySeconds = 0) {
+    const channel = this.channels[channelIndex];
+    channel.channelPressure = value & 0x7f;
+    this.updateChannelGain(channelIndex, delaySeconds);
+  }
+
   controlChange(channelIndex, controller, value, delaySeconds = 0) {
     const channel = this.channels[channelIndex];
+    const ccValue = value & 0x7f;
     switch (controller) {
       case 0:
-        channel.bankMsb = value & 0x7f;
+        channel.bankMsb = ccValue;
+        break;
+      case 1:
+        channel.modulation = ccValue;
+        this.updateModulation(channelIndex, delaySeconds);
+        break;
+      case 5:
+        channel.portamentoTime = ccValue;
         break;
       case 6:
-        if (channel.rpnMsb === 0 && channel.rpnLsb === 0) {
-          channel.pitchBendRange = clamp(value, 0, 24);
-        }
+        channel.dataEntryMsb = ccValue;
+        this.applyDataEntry(channelIndex, delaySeconds);
         break;
       case 7:
-        channel.volume = value & 0x7f;
+        channel.volume = ccValue;
+        this.updateChannelGain(channelIndex, delaySeconds);
         break;
       case 10:
-        channel.pan = value & 0x7f;
+        channel.pan = ccValue;
+        this.updatePan(channelIndex, delaySeconds);
         break;
       case 11:
-        channel.expression = value & 0x7f;
+        channel.expression = ccValue;
+        this.updateChannelGain(channelIndex, delaySeconds);
         break;
       case 32:
-        channel.bankLsb = value & 0x7f;
+        channel.bankLsb = ccValue;
+        break;
+      case 38:
+        channel.dataEntryLsb = ccValue;
+        this.applyDataEntry(channelIndex, delaySeconds);
         break;
       case 64:
-        channel.sustain = value >= 64;
+        channel.sustain = ccValue >= 64;
         if (!channel.sustain) {
           this.releaseSustained(channelIndex, delaySeconds);
         }
         break;
+      case 65:
+        channel.portamento = ccValue >= 64;
+        break;
+      case 66:
+        channel.sostenuto = ccValue >= 64;
+        break;
+      case 67:
+        channel.softPedal = ccValue >= 64;
+        this.updateChannelGain(channelIndex, delaySeconds);
+        break;
+      case 71:
+        channel.resonance = ccValue;
+        break;
+      case 72:
+        channel.releaseTime = ccValue;
+        break;
+      case 73:
+        channel.attackTime = ccValue;
+        break;
+      case 74:
+        channel.brightness = ccValue;
+        break;
+      case 91:
+        channel.reverbSend = ccValue;
+        break;
+      case 93:
+        channel.chorusSend = ccValue;
+        break;
+      case 96:
+        this.incrementSelectedParameter(channelIndex, 1, delaySeconds);
+        break;
+      case 97:
+        this.incrementSelectedParameter(channelIndex, -1, delaySeconds);
+        break;
+      case 98:
+        channel.nrpnLsb = ccValue;
+        channel.selectedParameter = "nrpn";
+        break;
+      case 99:
+        channel.nrpnMsb = ccValue;
+        channel.selectedParameter = "nrpn";
+        break;
       case 100:
-        channel.rpnLsb = value & 0x7f;
+        channel.rpnLsb = ccValue;
+        channel.selectedParameter = "rpn";
         break;
       case 101:
-        channel.rpnMsb = value & 0x7f;
+        channel.rpnMsb = ccValue;
+        channel.selectedParameter = "rpn";
         break;
       case 120:
+        this.allSoundOff(channelIndex);
+        break;
       case 123:
         this.allNotesOff(channelIndex, delaySeconds);
         break;
       case 121:
         resetChannelControllers(channel);
+        this.updatePitchBend(channelIndex, delaySeconds);
+        this.updateChannelGain(channelIndex, delaySeconds);
+        this.updatePan(channelIndex, delaySeconds);
+        this.updateModulation(channelIndex, delaySeconds);
+        break;
+      case 124:
+      case 125:
+      case 126:
+      case 127:
+        this.allNotesOff(channelIndex, delaySeconds);
         break;
       default:
         break;
     }
+  }
+
+  applyDataEntry(channelIndex, delaySeconds = 0) {
+    const channel = this.channels[channelIndex];
+    if (channel.selectedParameter === "rpn") {
+      this.applyRpn(channelIndex, delaySeconds);
+      return;
+    }
+
+    if (channel.selectedParameter === "nrpn") {
+      const key = `${channel.nrpnMsb}:${channel.nrpnLsb}`;
+      channel.nrpnValues.set(key, (channel.dataEntryMsb << 7) | channel.dataEntryLsb);
+    }
+  }
+
+  applyRpn(channelIndex, delaySeconds = 0) {
+    const channel = this.channels[channelIndex];
+    if (channel.rpnMsb === 127 && channel.rpnLsb === 127) {
+      return;
+    }
+
+    if (channel.rpnMsb === 0 && channel.rpnLsb === 0) {
+      channel.pitchBendRange = clamp(channel.dataEntryMsb, 0, 24);
+      channel.pitchBendRangeCents = clamp(channel.dataEntryLsb, 0, 99);
+      this.updatePitchBend(channelIndex, delaySeconds);
+    } else if (channel.rpnMsb === 0 && channel.rpnLsb === 1) {
+      const value14 = (channel.dataEntryMsb << 7) | channel.dataEntryLsb;
+      channel.fineTuningCents = ((value14 - 8192) / 8192) * 100;
+      this.updatePitchBend(channelIndex, delaySeconds);
+    } else if (channel.rpnMsb === 0 && channel.rpnLsb === 2) {
+      channel.coarseTuningSemitones = channel.dataEntryMsb - 64;
+      this.updatePitchBend(channelIndex, delaySeconds);
+    }
+  }
+
+  incrementSelectedParameter(channelIndex, delta, delaySeconds = 0) {
+    const channel = this.channels[channelIndex];
+    const value = clamp(((channel.dataEntryMsb << 7) | channel.dataEntryLsb) + delta, 0, 16383);
+    channel.dataEntryMsb = (value >> 7) & 0x7f;
+    channel.dataEntryLsb = value & 0x7f;
+    this.applyDataEntry(channelIndex, delaySeconds);
   }
 
   updatePitchBend(channelIndex, delaySeconds = 0) {
@@ -536,6 +872,47 @@ class EmbeddedSoundFontSynth {
     for (const voices of channel.activeNotes.values()) {
       for (const voice of voices) {
         voice.updatePitch(when);
+      }
+    }
+  }
+
+  updateChannelGain(channelIndex, delaySeconds = 0) {
+    const context = this.ensureAudioContext();
+    const channel = this.channels[channelIndex];
+    const when = context.currentTime + delaySeconds;
+    for (const voices of channel.activeNotes.values()) {
+      for (const voice of voices) {
+        voice.updateGain(when);
+      }
+    }
+  }
+
+  updatePan(channelIndex, delaySeconds = 0) {
+    const context = this.ensureAudioContext();
+    const channel = this.channels[channelIndex];
+    const when = context.currentTime + delaySeconds;
+    for (const voices of channel.activeNotes.values()) {
+      for (const voice of voices) {
+        voice.updatePan(when);
+      }
+    }
+  }
+
+  updateModulation(channelIndex, delaySeconds = 0) {
+    const context = this.ensureAudioContext();
+    const channel = this.channels[channelIndex];
+    const when = context.currentTime + delaySeconds;
+    for (const voices of channel.activeNotes.values()) {
+      for (const voice of voices) {
+        voice.updateModulation(when);
+      }
+    }
+  }
+
+  releaseExclusiveClass(channel, exclusiveClass, when) {
+    for (const voice of channel.activeVoices) {
+      if (voice.exclusiveClass === exclusiveClass && !voice.released) {
+        voice.release(when);
       }
     }
   }
@@ -573,7 +950,11 @@ class EmbeddedSoundFontSynth {
     channel.activeNotes.clear();
   }
 
-  allSoundOff() {
+  allSoundOff(channelIndex = null) {
+    if (channelIndex != null) {
+      this.allNotesOff(channelIndex);
+      return;
+    }
     for (let i = 0; i < this.channels.length; i += 1) {
       this.allNotesOff(i);
     }
@@ -593,20 +974,45 @@ class EmbeddedSoundFontSynth {
     const buffer = this.getSampleBuffer(context, sample, sampleWindow.start, sampleWindow.end);
     const source = context.createBufferSource();
     const gain = context.createGain();
+    const outputGain = context.createGain();
     const panner = typeof context.createStereoPanner === "function" ? context.createStereoPanner() : null;
+    const lfo = typeof context.createOscillator === "function" ? context.createOscillator() : null;
+    const lfoGain = lfo ? context.createGain() : null;
     const releaseSeconds = timecentsToSeconds(region.releaseVolEnv ?? -12000);
     const voice = {
       channel,
       source,
       gain,
+      outputGain,
+      panner,
+      lfo,
+      lfoGain,
       note,
+      velocity,
       region,
+      sample,
+      exclusiveClass: region.exclusiveClass || 0,
       released: false,
       sustained: false,
       updatePitch: (when) => {
         const ratio = pitchRatio(channel, note, region, sample);
         source.playbackRate.cancelScheduledValues(when);
         source.playbackRate.setValueAtTime(ratio, when);
+        voice.updateModulation(when);
+      },
+      updateGain: (when) => {
+        const value = channelGainFor(channel, note);
+        setAudioParam(outputGain.gain, value, when);
+      },
+      updatePan: (when) => {
+        if (panner) {
+          setAudioParam(panner.pan, panFor(channel, region), when);
+        }
+      },
+      updateModulation: (when) => {
+        if (lfoGain) {
+          setAudioParam(lfoGain.gain, modulationPlaybackRateDepth(channel, source.playbackRate.value || 1), when);
+        }
       },
       release: (when) => {
         if (voice.released) {
@@ -635,19 +1041,36 @@ class EmbeddedSoundFontSynth {
       source.loopEnd = loopEnd / sample.sampleRate;
     }
 
-    const amplitude = amplitudeFor(channel, velocity, region);
+    const amplitude = amplitudeFor(velocity, region);
     applyEnvelope(gain.gain, startTime, amplitude, region);
+    outputGain.gain.setValueAtTime(channelGainFor(channel, note), startTime);
+    if (lfo && lfoGain) {
+      lfo.frequency.setValueAtTime(5.5, startTime);
+      lfoGain.gain.setValueAtTime(modulationPlaybackRateDepth(channel, source.playbackRate.value || 1), startTime);
+      lfo.connect(lfoGain);
+      lfoGain.connect(source.playbackRate);
+      lfo.start(startTime);
+    }
 
     source.connect(gain);
+    gain.connect(outputGain);
     if (panner) {
       panner.pan.setValueAtTime(panFor(channel, region), startTime);
-      gain.connect(panner);
+      outputGain.connect(panner);
       panner.connect(this.masterGain);
     } else {
-      gain.connect(this.masterGain);
+      outputGain.connect(this.masterGain);
     }
 
     source.onended = () => {
+      channel.activeVoices.delete(voice);
+      if (lfo) {
+        try {
+          lfo.stop();
+        } catch {
+          // The oscillator may already have stopped with its source.
+        }
+      }
       const activeForNote = channel.activeNotes.get(note);
       if (!activeForNote) {
         return;
@@ -1073,27 +1496,43 @@ function pitchRatio(channel, note, region, sample) {
     : sample.originalPitch;
   const playedKey = region.keynum != null ? region.keynum : note;
   const scaleTuning = region.scaleTuning ?? 100;
-  const bendSemitones = (channel.pitchBend / 8192) * channel.pitchBendRange;
+  const bendSemitones = (channel.pitchBend / 8192) * (channel.pitchBendRange + channel.pitchBendRangeCents / 100);
   const semitones =
     ((playedKey - rootKey) * scaleTuning) / 100 +
     (region.coarseTune || 0) +
     (region.fineTune || 0) / 100 +
     (sample.pitchCorrection || 0) / 100 +
+    channel.coarseTuningSemitones +
+    channel.fineTuningCents / 100 +
     bendSemitones;
   return Math.pow(2, semitones / 12);
 }
 
-function amplitudeFor(channel, velocity, region) {
+function amplitudeFor(velocity, region) {
   const velocityGain = Math.pow((region.velocity != null ? region.velocity : velocity) / 127, 1.35);
-  const channelGain = (channel.volume / 127) * (channel.expression / 127);
   const attenuation = Math.pow(10, -(region.initialAttenuation || 0) / 200);
-  return clamp(velocityGain * channelGain * attenuation, 0.0001, 1);
+  return clamp(velocityGain * attenuation, 0.0001, 1);
+}
+
+function channelGainFor(channel, note) {
+  const pressure = channel.polyPressure.get(note) ?? channel.channelPressure;
+  const pressureGain = 0.75 + (pressure / 127) * 0.25;
+  const softPedalGain = channel.softPedal ? 0.72 : 1;
+  return clamp((channel.volume / 127) * (channel.expression / 127) * pressureGain * softPedalGain, 0.0001, 1);
 }
 
 function panFor(channel, region) {
   const channelPan = (channel.pan - 64) / 64;
   const regionPan = (region.pan || 0) / 500;
   return clamp(channelPan + regionPan, -1, 1);
+}
+
+function modulationPlaybackRateDepth(channel, playbackRate) {
+  if (!channel.modulation) {
+    return 0;
+  }
+  const depthCents = (channel.modulation / 127) * 35;
+  return playbackRate * (Math.pow(2, depthCents / 1200) - 1);
 }
 
 function regionMatches(region, note, velocity) {
@@ -1115,27 +1554,71 @@ function createChannelState(index) {
     program: 0,
     bankMsb: 0,
     bankLsb: 0,
+    modulation: 0,
     volume: 100,
     expression: 127,
     pan: 64,
     sustain: false,
+    sostenuto: false,
+    softPedal: false,
+    portamento: false,
+    portamentoTime: 0,
+    resonance: 64,
+    brightness: 64,
+    attackTime: 64,
+    releaseTime: 64,
+    reverbSend: 40,
+    chorusSend: 0,
     pitchBend: 0,
     pitchBendRange: DEFAULT_PITCH_BEND_RANGE,
+    pitchBendRangeCents: 0,
+    fineTuningCents: 0,
+    coarseTuningSemitones: 0,
+    channelPressure: 0,
+    polyPressure: new Map(),
     rpnMsb: 127,
     rpnLsb: 127,
-    activeNotes: new Map()
+    nrpnMsb: 127,
+    nrpnLsb: 127,
+    selectedParameter: "rpn",
+    dataEntryMsb: 0,
+    dataEntryLsb: 0,
+    nrpnValues: new Map(),
+    activeNotes: new Map(),
+    activeVoices: new Set()
   };
 }
 
 function resetChannelControllers(channel) {
+  channel.modulation = 0;
   channel.volume = 100;
   channel.expression = 127;
   channel.pan = 64;
   channel.sustain = false;
+  channel.sostenuto = false;
+  channel.softPedal = false;
+  channel.portamento = false;
+  channel.portamentoTime = 0;
+  channel.resonance = 64;
+  channel.brightness = 64;
+  channel.attackTime = 64;
+  channel.releaseTime = 64;
+  channel.reverbSend = 40;
+  channel.chorusSend = 0;
   channel.pitchBend = 0;
   channel.pitchBendRange = DEFAULT_PITCH_BEND_RANGE;
+  channel.pitchBendRangeCents = 0;
+  channel.fineTuningCents = 0;
+  channel.coarseTuningSemitones = 0;
+  channel.channelPressure = 0;
+  channel.polyPressure.clear();
   channel.rpnMsb = 127;
   channel.rpnLsb = 127;
+  channel.nrpnMsb = 127;
+  channel.nrpnLsb = 127;
+  channel.selectedParameter = "rpn";
+  channel.dataEntryMsb = 0;
+  channel.dataEntryLsb = 0;
 }
 
 function eventSortOrder(event) {
@@ -1147,6 +1630,140 @@ function eventSortOrder(event) {
   }
   const command = event.data[0] & 0xf0;
   return command === 0x80 || (command === 0x90 && event.data[2] === 0) ? 1 : 2;
+}
+
+function createMIDIConnectionEvent(port) {
+  return {
+    type: "statechange",
+    port,
+    timeStamp: performanceNow()
+  };
+}
+
+function parseMIDIMessageSequence(data, sysexEnabled) {
+  if (data == null || typeof data[Symbol.iterator] !== "function") {
+    throw new TypeError("MIDIOutput.send() data must be an iterable sequence of bytes.");
+  }
+
+  const bytes = Array.from(data, (value) => Number(value) & 0xff);
+  if (!bytes.length) {
+    throw new TypeError("MIDIOutput.send() data must contain at least one MIDI message.");
+  }
+
+  const messages = [];
+  let offset = 0;
+  while (offset < bytes.length) {
+    const status = bytes[offset];
+    if (status < 0x80) {
+      throw new TypeError("Running status is not allowed in MIDIOutput.send() data.");
+    }
+
+    if (status === 0xf0) {
+      const end = bytes.indexOf(0xf7, offset + 1);
+      if (end === -1) {
+        throw new TypeError("System Exclusive messages must terminate with 0xF7.");
+      }
+      if (!sysexEnabled) {
+        throw createDOMException("InvalidAccessError", "System Exclusive access was not enabled.");
+      }
+      messages.push(bytes.slice(offset, end + 1));
+      offset = end + 1;
+      continue;
+    }
+
+    if (status === 0xf7) {
+      throw new TypeError("Unexpected System Exclusive terminator.");
+    }
+
+    const length = midiMessageLength(status);
+    if (!length || offset + length > bytes.length) {
+      throw new TypeError("MIDIOutput.send() data contains an incomplete or invalid MIDI message.");
+    }
+
+    const message = bytes.slice(offset, offset + length);
+    for (let i = 1; i < message.length; i += 1) {
+      if (message[i] >= 0x80) {
+        throw new TypeError("MIDI data bytes must be less than 0x80.");
+      }
+    }
+    messages.push(message);
+    offset += length;
+  }
+
+  return messages;
+}
+
+function midiMessageLength(status) {
+  if (status >= 0x80 && status <= 0xef) {
+    const command = status & 0xf0;
+    return command === 0xc0 || command === 0xd0 ? 2 : 3;
+  }
+
+  switch (status) {
+    case 0xf1:
+    case 0xf3:
+      return 2;
+    case 0xf2:
+      return 3;
+    case 0xf6:
+    case 0xf8:
+    case 0xf9:
+    case 0xfa:
+    case 0xfb:
+    case 0xfc:
+    case 0xfd:
+    case 0xfe:
+    case 0xff:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+function createDOMException(name, message) {
+  if (typeof DOMException === "function") {
+    return new DOMException(message, name);
+  }
+  const error = new Error(message);
+  error.name = name;
+  return error;
+}
+
+function matchesSysex(bytes, pattern) {
+  if (bytes.length !== pattern.length) {
+    return false;
+  }
+  for (let i = 0; i < pattern.length; i += 1) {
+    if (pattern[i] != null && bytes[i] !== pattern[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isGsReset(bytes) {
+  if (bytes.length !== 11 || bytes[10] !== 0xf7) {
+    return false;
+  }
+  for (let i = 0; i < GS_RESET_PREFIX.length; i += 1) {
+    if (GS_RESET_PREFIX[i] != null && bytes[i] !== GS_RESET_PREFIX[i]) {
+      return false;
+    }
+  }
+  return bytes[9] === rolandChecksum(bytes.slice(5, 9));
+}
+
+function rolandChecksum(addressAndData) {
+  const sum = addressAndData.reduce((total, value) => total + value, 0);
+  return (128 - (sum % 128)) & 0x7f;
+}
+
+function setAudioParam(param, value, when) {
+  if (typeof param.setTargetAtTime === "function") {
+    param.setTargetAtTime(value, when, 0.01);
+  } else {
+    param.setValueAtTime(value, when);
+  }
 }
 
 function requiredChunk(chunks, name) {

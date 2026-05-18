@@ -6,7 +6,8 @@
   "description": "Web MIDI API override backed by an embedded SF2 SoundFont and Web Audio.",
   "scripts": {
     "build": "node scripts/clean-dist.mjs && rollup -c",
-    "serve": "node scripts/serve-demo.mjs"
+    "serve": "node scripts/serve-demo.mjs",
+    "test": "node scripts/smoke-test.mjs"
   },
   "devDependencies": {
     "rollup": "^4.41.1"

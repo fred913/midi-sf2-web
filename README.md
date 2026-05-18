@@ -13,6 +13,7 @@ The compiled userscript is `dist/sf2.user.js`. It includes the userscript header
 ```sh
 npm install
 npm run build
+npm test
 ```
 
 `npm run build` clears `dist/` and writes a fresh `dist/sf2.user.js`.
@@ -30,7 +31,7 @@ Open `http://127.0.0.1:4173/demo/index.html`, initialize the shim, then play C4 
 ```html
 <script src="dist/sf2.user.js"></script>
 <script>
-  const access = await navigator.requestMIDIAccess()
+  const access = await navigator.requestMIDIAccess({ sysex: true })
   const output = access.outputs.values().next().value
 
   output.send([0xc0, 0])
@@ -39,7 +40,7 @@ Open `http://127.0.0.1:4173/demo/index.html`, initialize the shim, then play C4 
 </script>
 ```
 
-The bundle also exposes `WebMidiAudioShim.playMidiFile(arrayBuffer)` for Standard MIDI files.
+The shim implements an output-only Web MIDI surface with `MIDIAccess.sysexEnabled`, `onstatechange`, `MIDIPort.open()`, `MIDIPort.close()`, queued `MIDIOutput.send(data, timestamp)`, and `MIDIOutput.clear()`. The bundle also exposes `WebMidiAudioShim.playMidiFile(arrayBuffer)`, which uses a lookahead scheduler for Standard MIDI files and recognizes common GM/GS reset messages.
 
 ## License
 
