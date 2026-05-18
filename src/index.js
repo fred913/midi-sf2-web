@@ -1,6 +1,5 @@
-import embeddedSoundFontBase64 from "../assets/GeneralUser-GS.sf2";
-
 const DEFAULT_OUTPUT_ID = "generaluser-gs-web-audio";
+const DEFAULT_SOUNDFONT_RESOURCE = "GENERAL_USER_GS_SF2";
 const MIDI_CHANNELS = 16;
 const PERCUSSION_CHANNEL = 9;
 const DEFAULT_PITCH_BEND_RANGE = 2;
@@ -76,7 +75,10 @@ export function installWebMidiAudioShim(options = {}) {
   const previousRequestMIDIAccess = targetNavigator.requestMIDIAccess;
   const synth = new EmbeddedSoundFontSynth({
     audioContext: options.audioContext,
-    soundFontBase64: options.soundFontBase64 || embeddedSoundFontBase64,
+    soundFontBase64: options.soundFontBase64,
+    soundFontUrl: options.soundFontUrl,
+    soundFontResourceName: options.soundFontResourceName,
+    getResourceUrl: options.getResourceUrl,
     masterGain: options.masterGain
   });
   const accessBySysex = new Map();
@@ -145,6 +147,9 @@ export async function playMidiFile(arrayBuffer, options = {}) {
   const output = options.output || firstMapValue(access.outputs);
   if (!output) {
     throw new Error("No MIDI output is available.");
+  }
+  if (typeof output.preload === "function") {
+    await output.preload();
   }
 
   const playbackRate = options.playbackRate || 1;
@@ -584,10 +589,16 @@ class LookaheadScheduler {
 
 class EmbeddedSoundFontSynth {
   constructor(options = {}) {
-    this.soundFontBase64 = options.soundFontBase64 || embeddedSoundFontBase64;
+    this.soundFontBase64 = options.soundFontBase64 || null;
+    this.soundFontUrl = options.soundFontUrl || null;
+    this.soundFontResourceName = options.soundFontResourceName || DEFAULT_SOUNDFONT_RESOURCE;
+    this.getResourceUrl = options.getResourceUrl || defaultGetResourceUrl();
     this.audioContext = options.audioContext || null;
     this.masterGainValue = options.masterGain ?? 0.85;
     this.soundFont = null;
+    this.soundFontPromise = null;
+    this.pendingMidi = [];
+    this.pendingMidiFlushAttached = false;
     this.masterGain = null;
     this.sampleBufferCache = new Map();
     this.maxVoices = positiveIntegerOrDefault(options.maxVoices, DEFAULT_MAX_VOICES);
@@ -596,7 +607,7 @@ class EmbeddedSoundFontSynth {
   }
 
   async preload() {
-    this.ensureSoundFont();
+    await this.loadSoundFont();
     this.ensureAudioContext();
     if (this.audioContext.state === "suspended") {
       await this.audioContext.resume();
@@ -609,6 +620,15 @@ class EmbeddedSoundFontSynth {
       return;
     }
 
+    if (!this.soundFont) {
+      this.deferMidi(bytes, delaySeconds);
+      return;
+    }
+
+    this.dispatchLoadedMidi(bytes, delaySeconds);
+  }
+
+  dispatchLoadedMidi(bytes, delaySeconds = 0) {
     const status = bytes[0];
     if (status >= 0xf0) {
       this.dispatchSystemMessage(bytes, delaySeconds);
@@ -649,6 +669,41 @@ class EmbeddedSoundFontSynth {
         break;
       default:
         break;
+    }
+  }
+
+  deferMidi(bytes, delaySeconds = 0) {
+    this.pendingMidi.push({
+      bytes: Array.from(bytes),
+      dueTimeMs: performanceNow() + Math.max(0, delaySeconds) * 1000
+    });
+    if (this.pendingMidiFlushAttached) {
+      return;
+    }
+    this.pendingMidiFlushAttached = true;
+    this.loadSoundFont()
+      .then(() => {
+        this.pendingMidiFlushAttached = false;
+        this.flushPendingMidi();
+      })
+      .catch((error) => {
+        this.pendingMidiFlushAttached = false;
+        this.pendingMidi.length = 0;
+        setTimeout(() => {
+          throw error;
+        }, 0);
+      });
+  }
+
+  flushPendingMidi() {
+    if (!this.soundFont || !this.pendingMidi.length) {
+      return;
+    }
+
+    const pending = this.pendingMidi.splice(0);
+    const now = performanceNow();
+    for (const item of pending) {
+      this.dispatchLoadedMidi(item.bytes, Math.max(0, (item.dueTimeMs - now) / 1000));
     }
   }
 
@@ -1263,10 +1318,65 @@ class EmbeddedSoundFontSynth {
 
   ensureSoundFont() {
     if (!this.soundFont) {
-      const arrayBuffer = base64ToArrayBuffer(this.soundFontBase64);
-      this.soundFont = parseSoundFont(arrayBuffer);
+      if (!this.soundFontBase64) {
+        throw new Error("The SoundFont is not loaded yet. Call preload() before reading it synchronously.");
+      }
+      this.soundFont = parseSoundFont(base64ToArrayBuffer(this.soundFontBase64));
     }
     return this.soundFont;
+  }
+
+  loadSoundFont() {
+    if (this.soundFont) {
+      return Promise.resolve(this.soundFont);
+    }
+    if (this.soundFontPromise) {
+      return this.soundFontPromise;
+    }
+
+    this.soundFontPromise = this.loadSoundFontArrayBuffer()
+      .then((arrayBuffer) => {
+        this.soundFont = parseSoundFont(arrayBuffer);
+        return this.soundFont;
+      })
+      .finally(() => {
+        this.soundFontPromise = null;
+      });
+    return this.soundFontPromise;
+  }
+
+  async loadSoundFontArrayBuffer() {
+    if (this.soundFontBase64) {
+      return base64ToArrayBuffer(this.soundFontBase64);
+    }
+
+    const url = this.resolveSoundFontUrl();
+    if (!url) {
+      throw new Error(`No SoundFont source is available. Add @resource ${this.soundFontResourceName} or pass soundFontUrl.`);
+    }
+
+    if (typeof fetch !== "function") {
+      throw new Error("fetch() is required to load the SoundFont resource URL.");
+    }
+
+    const response = await fetch(url);
+    if (!response.ok && response.status !== 0) {
+      throw new Error(`Failed to load SoundFont resource: HTTP ${response.status}`);
+    }
+    return response.arrayBuffer();
+  }
+
+  resolveSoundFontUrl() {
+    if (typeof this.soundFontUrl === "function") {
+      return this.soundFontUrl();
+    }
+    if (this.soundFontUrl) {
+      return this.soundFontUrl;
+    }
+    if (this.getResourceUrl) {
+      return this.getResourceUrl(this.soundFontResourceName);
+    }
+    return null;
   }
 }
 
@@ -1836,6 +1946,16 @@ function chooseOlderVoice(a, b) {
   return b.startedAt < a.startedAt ? b : a;
 }
 
+function defaultGetResourceUrl() {
+  if (typeof GM_getResourceURL === "function") {
+    return GM_getResourceURL;
+  }
+  if (typeof globalThis.GM_getResourceURL === "function") {
+    return globalThis.GM_getResourceURL.bind(globalThis);
+  }
+  return null;
+}
+
 function eventSortOrder(event) {
   if (event.tempo) {
     return 0;
@@ -2051,6 +2171,10 @@ function performanceNow() {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
 
-if (typeof window !== "undefined" && !window.__WEB_MIDI_AUDIO_SHIM_NO_AUTO_INSTALL__) {
-  installWebMidiAudioShim({ navigator: window.navigator });
+function pageGlobalThis() {
+  return typeof unsafeWindow !== "undefined" ? unsafeWindow : globalThis;
+}
+
+if (typeof window !== "undefined" && !pageGlobalThis().__WEB_MIDI_AUDIO_SHIM_NO_AUTO_INSTALL__) {
+  installWebMidiAudioShim({ navigator: pageGlobalThis().navigator });
 }

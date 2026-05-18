@@ -133,6 +133,7 @@ class FakeAudioContext {
 
 function loadBundle({ fakeClock = true } = {}) {
   const code = fs.readFileSync("dist/sf2.user.js", "utf8")
+  const soundFontBytes = fs.readFileSync("assets/GeneralUser-GS.sf2")
   let now = 0
   const context = {
     AudioContext: FakeAudioContext,
@@ -144,6 +145,21 @@ function loadBundle({ fakeClock = true } = {}) {
     navigator: {},
     setInterval,
     setTimeout,
+    GM_getResourceURL: (name) => {
+      assert.equal(name, "GENERAL_USER_GS_SF2")
+      return "tampermonkey-resource://GENERAL_USER_GS_SF2"
+    },
+    fetch: async (url) => {
+      assert.equal(url, "tampermonkey-resource://GENERAL_USER_GS_SF2")
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => soundFontBytes.buffer.slice(
+          soundFontBytes.byteOffset,
+          soundFontBytes.byteOffset + soundFontBytes.byteLength
+        )
+      }
+    },
     performance: fakeClock ? { now: () => now } : performance
   }
   context.advanceClock = (ms) => {
@@ -205,6 +221,7 @@ async function testSendValidationAndQueue() {
   const context = loadBundle()
   const access = await context.navigator.requestMIDIAccess()
   const output = outputFrom(access)
+  await output.preload()
 
   assert.throws(() => output.send([0x40, 0x7f]), /Running status/)
   assert.throws(() => output.send([0x90, 0x40]), /incomplete/)
@@ -222,11 +239,25 @@ async function testSendValidationAndQueue() {
   assert.equal(output.queue.length, 0)
 }
 
+async function testResourceDeferredSend() {
+  const context = loadBundle()
+  const access = await context.navigator.requestMIDIAccess()
+  const output = outputFrom(access)
+  const shim = context.WebMidiAudioShim.getInstalledWebMidiAudioShim()
+
+  output.send([0x90, 60, 100])
+  assert.equal(shim.synth.channels[0].activeNotes.size, 0)
+  await output.preload()
+  assert.equal(shim.synth.channels[0].activeNotes.get(60).length, 1)
+  output.clear()
+}
+
 async function testMidiAndResetMessages() {
   const context = loadBundle()
   const access = await context.navigator.requestMIDIAccess({ sysex: true })
   const output = outputFrom(access)
   const shim = context.WebMidiAudioShim.getInstalledWebMidiAudioShim()
+  await output.preload()
 
   output.send([0xc0, 10])
   output.send([0xb0, 7, 20])
@@ -262,6 +293,7 @@ async function testLazySharedModulationLfo() {
   const access = await context.navigator.requestMIDIAccess()
   const output = outputFrom(access)
   const shim = context.WebMidiAudioShim.getInstalledWebMidiAudioShim()
+  await output.preload()
 
   output.send([0x90, 60, 100])
   output.send([0x90, 64, 100])
@@ -299,6 +331,7 @@ async function testMidiParserAndPlayback() {
 async function testEmbeddedSoundFontStillLoads() {
   const context = loadBundle()
   const shim = context.WebMidiAudioShim.installWebMidiAudioShim({ navigator: context.navigator, force: true })
+  await shim.preload()
   const soundFont = shim.synth.ensureSoundFont()
   const preset = soundFont.getPreset(0, 0)
   assert.equal(preset.name, "Grand Piano")
@@ -306,6 +339,7 @@ async function testEmbeddedSoundFontStillLoads() {
 
 await testAccessAndPortState()
 await testSendValidationAndQueue()
+await testResourceDeferredSend()
 await testMidiAndResetMessages()
 await testLazySharedModulationLfo()
 await testMidiParserAndPlayback()

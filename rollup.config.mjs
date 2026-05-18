@@ -1,5 +1,3 @@
-import fs from "node:fs"
-
 const userscriptHeader = `// ==UserScript==
 // @name         SF2 Support for MidiShow
 // @namespace    http://tampermonkey.net/
@@ -8,26 +6,14 @@ const userscriptHeader = `// ==UserScript==
 // @author       Sheng Fan
 // @match        https://www.midishow.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=midishow.com
-// @grant        none
+// @resource     GENERAL_USER_GS_SF2 https://raw.githubusercontent.com/fred913/midi-sf2-web/main/assets/GeneralUser-GS.sf2
+// @grant        GM_getResourceURL
+// @grant        unsafeWindow
 // ==/UserScript==
 
 (function() {
   'use strict';
 `
-
-function inlineSf2Plugin() {
-  return {
-    name: "inline-sf2",
-    load(id) {
-      if (!id.endsWith(".sf2")) {
-        return null
-      }
-
-      const base64 = fs.readFileSync(id).toString("base64")
-      return `export default ${JSON.stringify(base64)};`
-    }
-  }
-}
 
 export default {
   input: "src/index.js",
@@ -37,13 +23,17 @@ export default {
     name: "WebMidiAudioShim",
     banner: userscriptHeader,
     footer: `
+  const pageGlobal = typeof unsafeWindow !== "undefined" ? unsafeWindow : globalThis
   if (typeof globalThis !== "undefined") {
     globalThis.WebMidiAudioShim = WebMidiAudioShim
+  }
+  if (pageGlobal && pageGlobal !== globalThis) {
+    pageGlobal.WebMidiAudioShim = WebMidiAudioShim
   }
 })();`,
     sourcemap: false,
     generatedCode: "es2015",
   },
-  plugins: [inlineSf2Plugin()],
+  plugins: [],
   treeshake: false
 }

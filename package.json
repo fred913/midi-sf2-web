@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Web MIDI API override backed by an embedded SF2 SoundFont and Web Audio.",
+  "description": "Web MIDI API override backed by a Tampermonkey SF2 resource and Web Audio.",
   "scripts": {
     "build": "node scripts/clean-dist.mjs && rollup -c",
     "serve": "node scripts/serve-demo.mjs",

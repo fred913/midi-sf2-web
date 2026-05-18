@@ -1,12 +1,12 @@
 # midi-sf2-web
 
-Tampermonkey userscript that overrides `navigator.requestMIDIAccess()` with a virtual Web MIDI output. MIDI messages are rendered through Web Audio using the embedded `assets/GeneralUser-GS.sf2` SoundFont, so playback works on browsers that do not expose compatible native MIDI output.
+Tampermonkey userscript that overrides `navigator.requestMIDIAccess()` with a virtual Web MIDI output. MIDI messages are rendered through Web Audio using `assets/GeneralUser-GS.sf2` loaded through Tampermonkey `GM_getResourceURL`, so playback works on browsers that do not expose compatible native MIDI output.
 
 ## Install
 
 [Install the latest userscript from GitHub raw](https://raw.githubusercontent.com/fred913/midi-sf2-web/main/dist/sf2.user.js).
 
-The compiled userscript is `dist/sf2.user.js`. It includes the userscript header and the SoundFont data inline as base64.
+The compiled userscript is `dist/sf2.user.js`. It includes the userscript header and references the SoundFont with `@resource GENERAL_USER_GS_SF2`; Tampermonkey caches that file outside the script body.
 
 ## Build
 
@@ -46,4 +46,4 @@ Playback is capped to avoid runaway CPU on dense files: defaults are `maxVoices:
 
 ## License
 
-This repository is not GPL-3-only. See [LICENSE](LICENSE) for the project code notice and the embedded GeneralUser GS v2.0.3 license. GeneralUser GS is by S. Christian Collins; the SoundFont metadata includes the copyright notice "1997-2025 by S. Christian Collins".
+This repository is not GPL-3-only. See [LICENSE](LICENSE) for the project code notice and the bundled GeneralUser GS v2.0.3 license. GeneralUser GS is by S. Christian Collins; the SoundFont metadata includes the copyright notice "1997-2025 by S. Christian Collins".
