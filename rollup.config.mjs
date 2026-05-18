@@ -1,7 +1,11 @@
+import fs from "node:fs"
+
+const packageJson = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
+
 const userscriptHeader = `// ==UserScript==
 // @name         SF2 Support for MidiShow
 // @namespace    http://tampermonkey.net/
-// @version      2026-05-18
+// @version      ${packageJson.version}
 // @description  try to take over the world!
 // @author       Sheng Fan
 // @match        https://www.midishow.com/*

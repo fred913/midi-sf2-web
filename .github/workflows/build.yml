@@ -9,6 +9,7 @@ on:
       - "package.json"
       - "package-lock.json"
       - "rollup.config.mjs"
+      - "scripts/bump-userscript-version.mjs"
       - "scripts/clean-dist.mjs"
       - "scripts/smoke-test.mjs"
 
@@ -43,6 +44,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Bump userscript version
+        run: npm run version:bump-userscript
+
       - name: Build
         run: npm run build
 
@@ -53,7 +57,7 @@ jobs:
         id: commit
         run: |-
           git add --all
-          git commit -m "CI build"
+          git commit -m "CI build [skip ci]"
         continue-on-error: true
 
       - name: Git push

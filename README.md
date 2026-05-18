@@ -18,6 +18,8 @@ npm test
 
 `npm run build` clears `dist/` and writes a fresh `dist/sf2.user.js`.
 
+The userscript header version is read from `package.json`. GitHub Actions runs `npm run version:bump-userscript` before its build so each uploaded `dist/sf2.user.js` gets a monotonic patch version such as `0.1.0`, `0.1.1`, and so on.
+
 ## Local Demo
 
 ```sh

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SF2 Support for MidiShow
 // @namespace    http://tampermonkey.net/
-// @version      2026-05-18
+// @version      0.1.0
 // @description  try to take over the world!
 // @author       Sheng Fan
 // @match        https://www.midishow.com/*
