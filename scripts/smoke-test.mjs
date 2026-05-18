@@ -292,6 +292,10 @@ async function testSendValidationAndQueue() {
   assert.throws(() => output.send([0x90, 0x40]), /incomplete/)
   assert.throws(() => output.send([0xf0, 0x7e, 0x7f, 0x09, 0x01, 0xf7]), /System Exclusive/)
 
+  output.send([0x90, 60, 0xf8, 100])
+  assert.equal(context.WebMidiAudioShim.getInstalledWebMidiAudioShim().synth.channels[0].activeNotes.get(60).length, 1)
+  output.send([0x80, 60, 0xfe, 0])
+
   output.send([0x90, 60, 100], 1000)
   assert.equal(context.WebMidiAudioShim.getInstalledWebMidiAudioShim().synth.channels[0].activeNotes.size, 0)
   context.advanceClock(800)

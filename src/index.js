@@ -2280,22 +2280,43 @@ function parseMIDIMessageSequence(data, sysexEnabled) {
       throw new TypeError("Unexpected System Exclusive terminator.");
     }
 
+    if (isRealtimeStatus(status)) {
+      messages.push([status]);
+      offset += 1;
+      continue;
+    }
+
     const length = midiMessageLength(status);
     if (!length || offset + length > bytes.length) {
       throw new TypeError("MIDIOutput.send() data contains an incomplete or invalid MIDI message.");
     }
 
-    const message = bytes.slice(offset, offset + length);
-    for (let i = 1; i < message.length; i += 1) {
-      if (message[i] >= 0x80) {
-        throw new TypeError("MIDI data bytes must be less than 0x80.");
+    const message = [status];
+    offset += 1;
+    while (message.length < length) {
+      if (offset >= bytes.length) {
+        throw new TypeError("MIDIOutput.send() data contains an incomplete or invalid MIDI message.");
       }
+      const byte = bytes[offset];
+      if (isRealtimeStatus(byte)) {
+        messages.push([byte]);
+        offset += 1;
+        continue;
+      }
+      if (byte >= 0x80) {
+        throw new TypeError("MIDIOutput.send() data contains a status byte before the previous message was complete.");
+      }
+      message.push(byte);
+      offset += 1;
     }
     messages.push(message);
-    offset += length;
   }
 
   return messages;
+}
+
+function isRealtimeStatus(byte) {
+  return byte >= 0xf8 && byte <= 0xff;
 }
 
 function midiMessageLength(status) {
