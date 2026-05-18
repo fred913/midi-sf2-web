@@ -2288,14 +2288,16 @@ function parseMIDIMessageSequence(data, sysexEnabled) {
 
     const length = midiMessageLength(status);
     if (!length) {
-      throw new TypeError("MIDIOutput.send() data contains an incomplete or invalid MIDI message.");
+      offset += 1;
+      continue;
     }
 
     const message = [status];
     offset += 1;
     while (message.length < length) {
       if (offset >= bytes.length) {
-        throw new TypeError("MIDIOutput.send() data contains an incomplete or invalid MIDI message.");
+        padMIDIMessage(message, length);
+        break;
       }
       const byte = bytes[offset];
       if (isRealtimeStatus(byte)) {
