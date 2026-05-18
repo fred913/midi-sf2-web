@@ -27,6 +27,10 @@ class FakeNode {
     this.target = target
     return target
   }
+
+  disconnect() {
+    this.target = null
+  }
 }
 
 class FakeGain extends FakeNode {
@@ -97,6 +101,7 @@ class FakeAudioContext {
     this.currentTime = 0
     this.destination = new FakeNode()
     this.state = "running"
+    this.oscillatorCount = 0
   }
 
   createGain() {
@@ -108,6 +113,7 @@ class FakeAudioContext {
   }
 
   createOscillator() {
+    this.oscillatorCount += 1
     return new FakeOscillator()
   }
 
@@ -251,6 +257,24 @@ async function testMidiAndResetMessages() {
   assert.equal(shim.synth.channels[0].program, 0)
 }
 
+async function testLazySharedModulationLfo() {
+  const context = loadBundle()
+  const access = await context.navigator.requestMIDIAccess()
+  const output = outputFrom(access)
+  const shim = context.WebMidiAudioShim.getInstalledWebMidiAudioShim()
+
+  output.send([0x90, 60, 100])
+  output.send([0x90, 64, 100])
+  assert.equal(shim.synth.audioContext.oscillatorCount, 0)
+
+  output.send([0xb0, 1, 100])
+  assert.equal(shim.synth.audioContext.oscillatorCount, 1)
+
+  output.send([0x90, 67, 100])
+  assert.equal(shim.synth.audioContext.oscillatorCount, 1)
+  output.clear()
+}
+
 async function testMidiParserAndPlayback() {
   const context = loadBundle({ fakeClock: false })
   const shim = context.WebMidiAudioShim.installWebMidiAudioShim({ navigator: context.navigator, force: true })
@@ -283,6 +307,7 @@ async function testEmbeddedSoundFontStillLoads() {
 await testAccessAndPortState()
 await testSendValidationAndQueue()
 await testMidiAndResetMessages()
+await testLazySharedModulationLfo()
 await testMidiParserAndPlayback()
 await testEmbeddedSoundFontStillLoads()
 

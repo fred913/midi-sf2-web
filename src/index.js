@@ -6,6 +6,11 @@ const PERCUSSION_CHANNEL = 9;
 const DEFAULT_PITCH_BEND_RANGE = 2;
 const DEFAULT_LOOKAHEAD_MS = 120;
 const DEFAULT_SCHEDULER_INTERVAL_MS = 25;
+const MIN_LOOKAHEAD_MS = 10;
+const MIN_SCHEDULER_INTERVAL_MS = 8;
+const DEFAULT_MAX_MESSAGES_PER_TICK = 4096;
+const DEFAULT_MAX_VOICES = 96;
+const DEFAULT_MAX_VOICES_PER_CHANNEL = 32;
 const GM_SYSTEM_ON = [0xf0, 0x7e, null, 0x09, 0x01, 0xf7];
 const GM2_SYSTEM_ON = [0xf0, 0x7e, null, 0x09, 0x03, 0xf7];
 const GS_RESET_PREFIX = [0xf0, 0x41, null, 0x42, 0x12, 0x40, 0x00, 0x7f, 0x00];
@@ -83,7 +88,8 @@ export function installWebMidiAudioShim(options = {}) {
         ...options,
         sysexEnabled,
         lookaheadMs: options.lookaheadMs ?? DEFAULT_LOOKAHEAD_MS,
-        schedulerIntervalMs: options.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS
+        schedulerIntervalMs: options.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS,
+        maxMessagesPerTick: options.maxMessagesPerTick ?? DEFAULT_MAX_MESSAGES_PER_TICK
       }));
     }
     return accessBySysex.get(sysexEnabled);
@@ -142,8 +148,9 @@ export async function playMidiFile(arrayBuffer, options = {}) {
   }
 
   const playbackRate = options.playbackRate || 1;
-  const lookaheadMs = options.lookaheadMs ?? DEFAULT_LOOKAHEAD_MS;
-  const schedulerIntervalMs = options.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS;
+  const lookaheadMs = positiveNumberOrDefault(options.lookaheadMs, DEFAULT_LOOKAHEAD_MS, MIN_LOOKAHEAD_MS);
+  const schedulerIntervalMs = positiveNumberOrDefault(options.schedulerIntervalMs, DEFAULT_SCHEDULER_INTERVAL_MS, MIN_SCHEDULER_INTERVAL_MS);
+  const maxEventsPerTick = positiveIntegerOrDefault(options.maxEventsPerTick, DEFAULT_MAX_MESSAGES_PER_TICK);
   const startedAt = performanceNow() + (options.startDelayMs || 0);
   let cursor = 0;
   let stopped = false;
@@ -154,14 +161,19 @@ export async function playMidiFile(arrayBuffer, options = {}) {
         return;
       }
       const horizon = performanceNow() + lookaheadMs;
-      while (cursor < events.length) {
+      const batch = [];
+      while (cursor < events.length && batch.length < maxEventsPerTick) {
         const eventTimestamp = startedAt + events[cursor].timeMs / playbackRate;
         if (eventTimestamp > horizon) {
           break;
         }
-        output.send(events[cursor].data, eventTimestamp);
+        batch.push({
+          data: events[cursor].data,
+          timestamp: eventTimestamp
+        });
         cursor += 1;
       }
+      scheduleOutputMessages(output, batch);
       if (cursor >= events.length) {
         scheduler.stop();
       }
@@ -389,7 +401,8 @@ class VirtualMIDIAccess extends SimpleEventTarget {
       name: options.outputName || "GeneralUser GS Web Audio",
       sysexEnabled: this.sysexEnabled,
       lookaheadMs: options.lookaheadMs ?? DEFAULT_LOOKAHEAD_MS,
-      schedulerIntervalMs: options.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS
+      schedulerIntervalMs: options.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS,
+      maxMessagesPerTick: options.maxMessagesPerTick ?? DEFAULT_MAX_MESSAGES_PER_TICK
     });
     this.outputs.set(output.id, output);
   }
@@ -412,7 +425,8 @@ class VirtualMIDIOutput extends SimpleEventTarget {
     this.state = "connected";
     this.connection = "closed";
     this.sysexEnabled = !!options.sysexEnabled;
-    this.lookaheadMs = options.lookaheadMs ?? DEFAULT_LOOKAHEAD_MS;
+    this.lookaheadMs = positiveNumberOrDefault(options.lookaheadMs, DEFAULT_LOOKAHEAD_MS, MIN_LOOKAHEAD_MS);
+    this.maxMessagesPerTick = positiveIntegerOrDefault(options.maxMessagesPerTick, DEFAULT_MAX_MESSAGES_PER_TICK);
     this.queue = [];
     this.queueSequence = 0;
     this.scheduler = new LookaheadScheduler({
@@ -445,14 +459,12 @@ class VirtualMIDIOutput extends SimpleEventTarget {
   }
 
   send(data, timestamp = 0) {
+    this.scheduleMessages([{ data, timestamp }]);
+  }
+
+  scheduleMessages(items) {
     if (this.state === "disconnected") {
       throw createDOMException("InvalidStateError", "Cannot send to a disconnected MIDI output.");
-    }
-
-    const messages = parseMIDIMessageSequence(data, this.sysexEnabled);
-    const timestampNumber = Number(timestamp || 0);
-    if (!Number.isFinite(timestampNumber) || timestampNumber < 0) {
-      throw new TypeError("MIDIOutput.send() timestamp must be a finite non-negative number.");
     }
 
     if (this.connection === "closed") {
@@ -460,17 +472,46 @@ class VirtualMIDIOutput extends SimpleEventTarget {
     }
 
     const now = performanceNow();
-    const sendTimestamp = timestampNumber > now ? timestampNumber : now;
-    for (const message of messages) {
-      this.queue.push({
-        bytes: message,
-        timestamp: sendTimestamp,
-        sequence: this.queueSequence
-      });
-      this.queueSequence += 1;
+    for (const item of items) {
+      const messages = parseMIDIMessageSequence(item.data, this.sysexEnabled);
+      const timestampNumber = Number(item.timestamp || 0);
+      if (!Number.isFinite(timestampNumber) || timestampNumber < 0) {
+        throw new TypeError("MIDIOutput.send() timestamp must be a finite non-negative number.");
+      }
+
+      const sendTimestamp = timestampNumber > now ? timestampNumber : now;
+      for (const message of messages) {
+        this.enqueueMessage(message, sendTimestamp);
+      }
     }
-    this.queue.sort((a, b) => a.timestamp - b.timestamp || a.sequence - b.sequence);
     this.flushQueue();
+  }
+
+  enqueueMessage(bytes, timestamp) {
+    const item = {
+      bytes,
+      timestamp,
+      sequence: this.queueSequence
+    };
+    this.queueSequence += 1;
+
+    const last = this.queue[this.queue.length - 1];
+    if (!last || compareQueuedMidiMessage(last, item) <= 0) {
+      this.queue.push(item);
+      return;
+    }
+
+    let low = 0;
+    let high = this.queue.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (compareQueuedMidiMessage(this.queue[middle], item) <= 0) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    this.queue.splice(low, 0, item);
   }
 
   clear() {
@@ -491,10 +532,12 @@ class VirtualMIDIOutput extends SimpleEventTarget {
 
     const now = performanceNow();
     const horizon = now + this.lookaheadMs;
-    while (this.queue.length && this.queue[0].timestamp <= horizon) {
+    let sent = 0;
+    while (this.queue.length && this.queue[0].timestamp <= horizon && sent < this.maxMessagesPerTick) {
       const item = this.queue.shift();
       const delaySeconds = Math.max(0, (item.timestamp - now) / 1000);
       this.synth.dispatchMidi(item.bytes, delaySeconds);
+      sent += 1;
     }
 
     if (this.queue.length) {
@@ -514,7 +557,7 @@ class VirtualMIDIOutput extends SimpleEventTarget {
 
 class LookaheadScheduler {
   constructor(options) {
-    this.intervalMs = options.intervalMs;
+    this.intervalMs = positiveNumberOrDefault(options.intervalMs, DEFAULT_SCHEDULER_INTERVAL_MS, MIN_SCHEDULER_INTERVAL_MS);
     this.onTick = options.onTick;
     this.timer = null;
   }
@@ -547,6 +590,8 @@ class EmbeddedSoundFontSynth {
     this.soundFont = null;
     this.masterGain = null;
     this.sampleBufferCache = new Map();
+    this.maxVoices = positiveIntegerOrDefault(options.maxVoices, DEFAULT_MAX_VOICES);
+    this.maxVoicesPerChannel = positiveIntegerOrDefault(options.maxVoicesPerChannel, DEFAULT_MAX_VOICES_PER_CHANNEL);
     this.channels = Array.from({ length: MIDI_CHANNELS }, (_, index) => createChannelState(index));
   }
 
@@ -626,6 +671,7 @@ class EmbeddedSoundFontSynth {
     for (let i = 0; i < this.channels.length; i += 1) {
       const existingNotes = this.channels[i].activeNotes;
       const existingVoices = this.channels[i].activeVoices;
+      this.disposeChannelLfo(this.channels[i]);
       this.channels[i] = createChannelState(i);
       existingNotes.clear();
       existingVoices.clear();
@@ -671,6 +717,7 @@ class EmbeddedSoundFontSynth {
     for (const voice of voices) {
       channel.activeVoices.add(voice);
     }
+    this.enforceVoiceLimits(channel, startTime);
   }
 
   noteOff(channelIndex, note, delaySeconds = 0) {
@@ -902,10 +949,8 @@ class EmbeddedSoundFontSynth {
     const context = this.ensureAudioContext();
     const channel = this.channels[channelIndex];
     const when = context.currentTime + delaySeconds;
-    for (const voices of channel.activeNotes.values()) {
-      for (const voice of voices) {
-        voice.updateModulation(when);
-      }
+    for (const voice of channel.activeVoices) {
+      voice.updateModulation(when);
     }
   }
 
@@ -952,12 +997,106 @@ class EmbeddedSoundFontSynth {
 
   allSoundOff(channelIndex = null) {
     if (channelIndex != null) {
-      this.allNotesOff(channelIndex);
+      this.stopChannelSound(this.channels[channelIndex]);
       return;
     }
     for (let i = 0; i < this.channels.length; i += 1) {
-      this.allNotesOff(i);
+      this.stopChannelSound(this.channels[i]);
     }
+  }
+
+  stopChannelSound(channel, delaySeconds = 0) {
+    const context = this.ensureAudioContext();
+    const when = context.currentTime + delaySeconds;
+    for (const voice of channel.activeVoices) {
+      voice.release(when, true);
+    }
+    channel.activeNotes.clear();
+  }
+
+  enforceVoiceLimits(channel, when) {
+    while (countManagedVoices(channel.activeVoices) > this.maxVoicesPerChannel) {
+      const voice = selectVoiceToStop(channel.activeVoices);
+      if (!voice) {
+        break;
+      }
+      voice.release(when, true);
+    }
+
+    while (this.countManagedVoices() > this.maxVoices) {
+      const voice = this.selectGlobalVoiceToStop();
+      if (!voice) {
+        break;
+      }
+      voice.release(when, true);
+    }
+  }
+
+  countManagedVoices() {
+    let count = 0;
+    for (const channel of this.channels) {
+      count += countManagedVoices(channel.activeVoices);
+    }
+    return count;
+  }
+
+  selectGlobalVoiceToStop() {
+    let selected = null;
+    for (const channel of this.channels) {
+      selected = chooseOlderVoice(selected, selectVoiceToStop(channel.activeVoices));
+    }
+    return selected;
+  }
+
+  ensureChannelLfo(channel, context, when) {
+    if (channel.lfo || typeof context.createOscillator !== "function") {
+      return channel.lfo;
+    }
+
+    const lfo = context.createOscillator();
+    lfo.frequency.setValueAtTime(5.5, when);
+    lfo.start(when);
+    channel.lfo = lfo;
+    return lfo;
+  }
+
+  updateVoiceModulation(voice, when) {
+    const channel = voice.channel;
+    if (!channel.modulation) {
+      if (voice.lfoGain) {
+        setAudioParam(voice.lfoGain.gain, 0, when);
+      }
+      return;
+    }
+
+    const context = this.ensureAudioContext();
+    const lfo = this.ensureChannelLfo(channel, context, when);
+    if (!lfo || typeof context.createGain !== "function") {
+      return;
+    }
+
+    if (!voice.lfoGain) {
+      voice.lfoGain = context.createGain();
+      voice.lfoGain.gain.setValueAtTime(0, when);
+      lfo.connect(voice.lfoGain);
+      voice.lfoGain.connect(voice.source.playbackRate);
+    }
+    setAudioParam(voice.lfoGain.gain, modulationPlaybackRateDepth(channel, voice.source.playbackRate.value || 1), when);
+  }
+
+  disposeChannelLfo(channel) {
+    if (!channel.lfo) {
+      return;
+    }
+    try {
+      channel.lfo.stop();
+    } catch {
+      // The LFO may already have been stopped.
+    }
+    if (typeof channel.lfo.disconnect === "function") {
+      channel.lfo.disconnect();
+    }
+    channel.lfo = null;
   }
 
   createVoice(context, channel, channelIndex, note, velocity, region, startTime) {
@@ -976,8 +1115,6 @@ class EmbeddedSoundFontSynth {
     const gain = context.createGain();
     const outputGain = context.createGain();
     const panner = typeof context.createStereoPanner === "function" ? context.createStereoPanner() : null;
-    const lfo = typeof context.createOscillator === "function" ? context.createOscillator() : null;
-    const lfoGain = lfo ? context.createGain() : null;
     const releaseSeconds = timecentsToSeconds(region.releaseVolEnv ?? -12000);
     const voice = {
       channel,
@@ -985,15 +1122,16 @@ class EmbeddedSoundFontSynth {
       gain,
       outputGain,
       panner,
-      lfo,
-      lfoGain,
+      lfoGain: null,
       note,
       velocity,
       region,
       sample,
       exclusiveClass: region.exclusiveClass || 0,
       released: false,
+      stopping: false,
       sustained: false,
+      startedAt: startTime,
       updatePitch: (when) => {
         const ratio = pitchRatio(channel, note, region, sample);
         source.playbackRate.cancelScheduledValues(when);
@@ -1010,20 +1148,22 @@ class EmbeddedSoundFontSynth {
         }
       },
       updateModulation: (when) => {
-        if (lfoGain) {
-          setAudioParam(lfoGain.gain, modulationPlaybackRateDepth(channel, source.playbackRate.value || 1), when);
-        }
+        this.updateVoiceModulation(voice, when);
       },
-      release: (when) => {
-        if (voice.released) {
+      release: (when, fast = false) => {
+        if (voice.stopping || (voice.released && !fast)) {
           return;
         }
         voice.released = true;
+        if (fast) {
+          voice.stopping = true;
+        }
+        const releaseDuration = fast ? 0.015 : Math.max(0.015, releaseSeconds);
         gain.gain.cancelScheduledValues(when);
         gain.gain.setValueAtTime(Math.max(gain.gain.value, 0.0001), when);
-        gain.gain.exponentialRampToValueAtTime(0.0001, when + Math.max(0.015, releaseSeconds));
+        gain.gain.exponentialRampToValueAtTime(0.0001, when + releaseDuration);
         try {
-          source.stop(when + Math.max(0.03, releaseSeconds) + 0.05);
+          source.stop(when + Math.max(0.03, releaseDuration) + 0.05);
         } catch {
           // The source may have already ended for one-shot samples.
         }
@@ -1044,13 +1184,7 @@ class EmbeddedSoundFontSynth {
     const amplitude = amplitudeFor(velocity, region);
     applyEnvelope(gain.gain, startTime, amplitude, region);
     outputGain.gain.setValueAtTime(channelGainFor(channel, note), startTime);
-    if (lfo && lfoGain) {
-      lfo.frequency.setValueAtTime(5.5, startTime);
-      lfoGain.gain.setValueAtTime(modulationPlaybackRateDepth(channel, source.playbackRate.value || 1), startTime);
-      lfo.connect(lfoGain);
-      lfoGain.connect(source.playbackRate);
-      lfo.start(startTime);
-    }
+    voice.updateModulation(startTime);
 
     source.connect(gain);
     gain.connect(outputGain);
@@ -1064,12 +1198,12 @@ class EmbeddedSoundFontSynth {
 
     source.onended = () => {
       channel.activeVoices.delete(voice);
-      if (lfo) {
-        try {
-          lfo.stop();
-        } catch {
-          // The oscillator may already have stopped with its source.
-        }
+      if (voice.lfoGain && typeof voice.lfoGain.disconnect === "function") {
+        voice.lfoGain.disconnect();
+        voice.lfoGain = null;
+      }
+      if (!channel.activeVoices.size) {
+        this.disposeChannelLfo(channel);
       }
       const activeForNote = channel.activeNotes.get(note);
       if (!activeForNote) {
@@ -1585,7 +1719,8 @@ function createChannelState(index) {
     dataEntryLsb: 0,
     nrpnValues: new Map(),
     activeNotes: new Map(),
-    activeVoices: new Set()
+    activeVoices: new Set(),
+    lfo: null
   };
 }
 
@@ -1619,6 +1754,86 @@ function resetChannelControllers(channel) {
   channel.selectedParameter = "rpn";
   channel.dataEntryMsb = 0;
   channel.dataEntryLsb = 0;
+}
+
+function scheduleOutputMessages(output, batch) {
+  if (!batch.length) {
+    return;
+  }
+  if (typeof output.scheduleMessages === "function") {
+    output.scheduleMessages(batch);
+    return;
+  }
+  for (const item of batch) {
+    output.send(item.data, item.timestamp);
+  }
+}
+
+function compareQueuedMidiMessage(a, b) {
+  return a.timestamp - b.timestamp || a.sequence - b.sequence;
+}
+
+function positiveNumberOrDefault(value, defaultValue, minimum = 0) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) {
+    return Math.max(minimum, defaultValue);
+  }
+  return Math.max(minimum, number);
+}
+
+function positiveIntegerOrDefault(value, defaultValue) {
+  const number = Math.floor(Number(value));
+  if (!Number.isFinite(number) || number <= 0) {
+    return defaultValue;
+  }
+  return number;
+}
+
+function countManagedVoices(voices) {
+  let count = 0;
+  for (const voice of voices) {
+    if (!voice.stopping) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function selectVoiceToStop(voices) {
+  let selected = null;
+  for (const voice of voices) {
+    if (voice.stopping) {
+      continue;
+    }
+    if (!selected) {
+      selected = voice;
+      continue;
+    }
+    if (voice.released && !selected.released) {
+      selected = voice;
+      continue;
+    }
+    if (voice.released === selected.released && voice.startedAt < selected.startedAt) {
+      selected = voice;
+    }
+  }
+  return selected;
+}
+
+function chooseOlderVoice(a, b) {
+  if (!a) {
+    return b;
+  }
+  if (!b) {
+    return a;
+  }
+  if (b.released && !a.released) {
+    return b;
+  }
+  if (a.released && !b.released) {
+    return a;
+  }
+  return b.startedAt < a.startedAt ? b : a;
 }
 
 function eventSortOrder(event) {
