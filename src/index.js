@@ -1,5 +1,8 @@
 const DEFAULT_OUTPUT_ID = "generaluser-gs-web-audio";
-const DEFAULT_SOUNDFONT_RESOURCE = "GENERAL_USER_GS_SF2";
+const DEFAULT_SOUNDFONT_URL = "https://raw.githubusercontent.com/fred913/midi-sf2-web/main/assets/GeneralUser-GS.sf2";
+const DEFAULT_SOUNDFONT_CACHE_KEY = "GeneralUser-GS-v2.0.3";
+const SOUNDFONT_CACHE_DB = "midi-sf2-web";
+const SOUNDFONT_CACHE_STORE = "soundfonts";
 const MIDI_CHANNELS = 16;
 const PERCUSSION_CHANNEL = 9;
 const DEFAULT_PITCH_BEND_RANGE = 2;
@@ -77,8 +80,9 @@ export function installWebMidiAudioShim(options = {}) {
     audioContext: options.audioContext,
     soundFontBase64: options.soundFontBase64,
     soundFontUrl: options.soundFontUrl,
-    soundFontResourceName: options.soundFontResourceName,
-    getResourceUrl: options.getResourceUrl,
+    soundFontCacheKey: options.soundFontCacheKey,
+    cacheSoundFont: options.cacheSoundFont,
+    progress: options.progress,
     masterGain: options.masterGain
   });
   const accessBySysex = new Map();
@@ -125,6 +129,9 @@ export function installWebMidiAudioShim(options = {}) {
     },
     preload() {
       return synth.preload();
+    },
+    clearSoundFontCache() {
+      return synth.clearCache();
     }
   };
 
@@ -139,6 +146,10 @@ export async function preloadEmbeddedSoundFont() {
   const shim = installedShim || installWebMidiAudioShim();
   await shim.preload();
   return shim.synth;
+}
+
+export function clearSoundFontCache(cacheKey = DEFAULT_SOUNDFONT_CACHE_KEY) {
+  return deleteCachedSoundFont(cacheKey);
 }
 
 export async function playMidiFile(arrayBuffer, options = {}) {
@@ -590,9 +601,10 @@ class LookaheadScheduler {
 class EmbeddedSoundFontSynth {
   constructor(options = {}) {
     this.soundFontBase64 = options.soundFontBase64 || null;
-    this.soundFontUrl = options.soundFontUrl || null;
-    this.soundFontResourceName = options.soundFontResourceName || DEFAULT_SOUNDFONT_RESOURCE;
-    this.getResourceUrl = options.getResourceUrl || defaultGetResourceUrl();
+    this.soundFontUrl = options.soundFontUrl || DEFAULT_SOUNDFONT_URL;
+    this.soundFontCacheKey = options.soundFontCacheKey || DEFAULT_SOUNDFONT_CACHE_KEY;
+    this.cacheSoundFont = options.cacheSoundFont !== false;
+    this.progress = options.progress === false ? null : options.progress || null;
     this.audioContext = options.audioContext || null;
     this.masterGainValue = options.masterGain ?? 0.85;
     this.soundFont = null;
@@ -1352,18 +1364,30 @@ class EmbeddedSoundFontSynth {
 
     const url = this.resolveSoundFontUrl();
     if (!url) {
-      throw new Error(`No SoundFont source is available. Add @resource ${this.soundFontResourceName} or pass soundFontUrl.`);
+      throw new Error("No SoundFont source is available. Pass soundFontUrl or soundFontBase64.");
     }
 
-    if (typeof fetch !== "function") {
-      throw new Error("fetch() is required to load the SoundFont resource URL.");
+    if (this.cacheSoundFont) {
+      const cached = await readCachedSoundFont(this.soundFontCacheKey);
+      if (cached) {
+        return cached;
+      }
     }
 
-    const response = await fetch(url);
-    if (!response.ok && response.status !== 0) {
-      throw new Error(`Failed to load SoundFont resource: HTTP ${response.status}`);
+    const progress = this.progress || createSoundFontProgressOverlay();
+    this.progress = progress;
+    let arrayBuffer;
+    try {
+      arrayBuffer = await downloadSoundFont(url, progress);
+      if (this.cacheSoundFont) {
+        await writeCachedSoundFont(this.soundFontCacheKey, arrayBuffer, { url });
+      }
+      progress.finish();
+    } catch (error) {
+      progress.fail(error);
+      throw error;
     }
-    return response.arrayBuffer();
+    return arrayBuffer;
   }
 
   resolveSoundFontUrl() {
@@ -1373,10 +1397,15 @@ class EmbeddedSoundFontSynth {
     if (this.soundFontUrl) {
       return this.soundFontUrl;
     }
-    if (this.getResourceUrl) {
-      return this.getResourceUrl(this.soundFontResourceName);
-    }
     return null;
+  }
+
+  clearCache() {
+    this.soundFont = null;
+    this.soundFontPromise = null;
+    this.pendingMidi.length = 0;
+    this.sampleBufferCache.clear();
+    return deleteCachedSoundFont(this.soundFontCacheKey);
   }
 }
 
@@ -1946,14 +1975,255 @@ function chooseOlderVoice(a, b) {
   return b.startedAt < a.startedAt ? b : a;
 }
 
-function defaultGetResourceUrl() {
-  if (typeof GM_getResourceURL === "function") {
-    return GM_getResourceURL;
+async function downloadSoundFont(url, progress) {
+  const fetchFn = typeof fetch === "function" ? fetch : pageGlobalThis()?.fetch?.bind(pageGlobalThis());
+  if (typeof fetchFn !== "function") {
+    throw new Error("fetch() is required to download the SoundFont.");
   }
-  if (typeof globalThis.GM_getResourceURL === "function") {
-    return globalThis.GM_getResourceURL.bind(globalThis);
+
+  progress.show();
+  const response = await fetchFn(url, { cache: "no-store" });
+  if (!response.ok && response.status !== 0) {
+    throw new Error(`Failed to download SoundFont: HTTP ${response.status}`);
   }
-  return null;
+
+  const total = Number(response.headers?.get?.("content-length")) || 0;
+  if (!response.body || typeof response.body.getReader !== "function") {
+    const arrayBuffer = await response.arrayBuffer();
+    progress.update(arrayBuffer.byteLength, total || arrayBuffer.byteLength);
+    return arrayBuffer;
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let received = 0;
+  while (true) {
+    const result = await reader.read();
+    if (result.done) {
+      break;
+    }
+    chunks.push(result.value);
+    received += result.value.byteLength;
+    progress.update(received, total);
+  }
+
+  progress.update(received, total || received);
+  return concatenateUint8Arrays(chunks, received).buffer;
+}
+
+function concatenateUint8Arrays(chunks, byteLength) {
+  const combined = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return combined;
+}
+
+async function readCachedSoundFont(key) {
+  const db = await openSoundFontCache();
+  if (!db) {
+    return null;
+  }
+  try {
+    const record = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).get(key));
+    return isArrayBuffer(record?.data) ? record.data : null;
+  } catch {
+    return null;
+  } finally {
+    db.close?.();
+  }
+}
+
+async function writeCachedSoundFont(key, arrayBuffer, metadata = {}) {
+  const db = await openSoundFontCache();
+  if (!db) {
+    return;
+  }
+  try {
+    await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readwrite").objectStore(SOUNDFONT_CACHE_STORE).put({
+      key,
+      data: arrayBuffer,
+      byteLength: arrayBuffer.byteLength,
+      url: metadata.url || "",
+      updatedAt: Date.now()
+    }));
+  } catch {
+    // Playback still works without a persistent cache.
+  } finally {
+    db.close?.();
+  }
+}
+
+async function deleteCachedSoundFont(key) {
+  const db = await openSoundFontCache();
+  if (!db) {
+    return;
+  }
+  try {
+    await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readwrite").objectStore(SOUNDFONT_CACHE_STORE).delete(key));
+  } catch {
+    // Nothing useful to report for cache cleanup failures.
+  } finally {
+    db.close?.();
+  }
+}
+
+function openSoundFontCache() {
+  if (typeof indexedDB === "undefined" || !indexedDB?.open) {
+    return Promise.resolve(null);
+  }
+
+  return new Promise((resolve) => {
+    const request = indexedDB.open(SOUNDFONT_CACHE_DB, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(SOUNDFONT_CACHE_STORE)) {
+        db.createObjectStore(SOUNDFONT_CACHE_STORE, { keyPath: "key" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => resolve(null);
+    request.onblocked = () => resolve(null);
+  });
+}
+
+function idbRequestToPromise(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("IndexedDB request failed."));
+  });
+}
+
+function isArrayBuffer(value) {
+  return Object.prototype.toString.call(value) === "[object ArrayBuffer]";
+}
+
+function createSoundFontProgressOverlay() {
+  if (typeof document === "undefined" || typeof document.createElement !== "function") {
+    return noopProgress();
+  }
+
+  let host = null;
+  let label = null;
+  let detail = null;
+  let fill = null;
+  let hideTimer = null;
+
+  function ensure() {
+    if (host) {
+      return;
+    }
+
+    host = document.createElement("div");
+    host.style.cssText = [
+      "position:fixed",
+      "left:50%",
+      "bottom:18px",
+      "transform:translateX(-50%)",
+      "z-index:2147483647",
+      "width:min(420px,calc(100vw - 32px))",
+      "box-sizing:border-box",
+      "padding:12px 14px",
+      "border-radius:8px",
+      "background:rgba(18,18,22,0.94)",
+      "color:#fff",
+      "font:13px/1.35 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+      "box-shadow:0 10px 30px rgba(0,0,0,0.28)",
+      "pointer-events:none"
+    ].join(";");
+
+    label = document.createElement("div");
+    label.textContent = "Downloading SoundFont";
+    label.style.cssText = "font-weight:600;margin-bottom:6px";
+
+    const track = document.createElement("div");
+    track.style.cssText = "height:6px;border-radius:999px;background:rgba(255,255,255,0.18);overflow:hidden";
+
+    fill = document.createElement("div");
+    fill.style.cssText = "height:100%;width:0%;border-radius:999px;background:#7dd3fc;transition:width 120ms linear";
+    track.appendChild(fill);
+
+    detail = document.createElement("div");
+    detail.textContent = "Starting download";
+    detail.style.cssText = "margin-top:6px;color:rgba(255,255,255,0.78);font-size:12px";
+
+    host.appendChild(label);
+    host.appendChild(track);
+    host.appendChild(detail);
+  }
+
+  function attach() {
+    ensure();
+    if (hideTimer) {
+      clearTimeout(hideTimer);
+      hideTimer = null;
+    }
+    if (!host.isConnected) {
+      (document.body || document.documentElement).appendChild(host);
+    }
+  }
+
+  function detach(delay = 700) {
+    hideTimer = setTimeout(() => {
+      host?.remove();
+    }, delay);
+  }
+
+  return {
+    show() {
+      attach();
+      label.textContent = "Downloading SoundFont";
+      detail.textContent = "Starting download";
+      fill.style.width = "0%";
+      fill.style.background = "#7dd3fc";
+    },
+    update(loaded, total) {
+      attach();
+      if (total > 0) {
+        const percent = clamp((loaded / total) * 100, 0, 100);
+        fill.style.width = `${percent.toFixed(1)}%`;
+        detail.textContent = `${formatBytes(loaded)} / ${formatBytes(total)} (${Math.round(percent)}%)`;
+      } else {
+        fill.style.width = "100%";
+        detail.textContent = `${formatBytes(loaded)} downloaded`;
+      }
+    },
+    finish() {
+      attach();
+      label.textContent = "SoundFont ready";
+      detail.textContent = "Cached for future loads";
+      fill.style.width = "100%";
+      fill.style.background = "#86efac";
+      detach();
+    },
+    fail(error) {
+      attach();
+      label.textContent = "SoundFont download failed";
+      detail.textContent = error?.message || "Unknown error";
+      fill.style.background = "#fb7185";
+    }
+  };
+}
+
+function noopProgress() {
+  return {
+    show() {},
+    update() {},
+    finish() {},
+    fail() {}
+  };
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function eventSortOrder(event) {

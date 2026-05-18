@@ -6,8 +6,6 @@ const userscriptHeader = `// ==UserScript==
 // @author       Sheng Fan
 // @match        https://www.midishow.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=midishow.com
-// @resource     GENERAL_USER_GS_SF2 https://raw.githubusercontent.com/fred913/midi-sf2-web/main/assets/GeneralUser-GS.sf2
-// @grant        GM_getResourceURL
 // @grant        unsafeWindow
 // ==/UserScript==
 

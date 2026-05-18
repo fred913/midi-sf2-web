@@ -13,7 +13,8 @@ Embedded SoundFont
 ------------------
 
 This repository includes GeneralUser GS v2.0.3 as `assets/GeneralUser-GS.sf2`.
-The generated userscript references it as a Tampermonkey `@resource`.
+The generated userscript downloads and caches that file separately from the
+script body.
 
 GeneralUser GS is by S. Christian Collins. The SoundFont metadata includes the
 copyright notice: "1997-2025 by S. Christian Collins".

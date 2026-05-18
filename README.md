@@ -1,12 +1,12 @@
 # midi-sf2-web
 
-Tampermonkey userscript that overrides `navigator.requestMIDIAccess()` with a virtual Web MIDI output. MIDI messages are rendered through Web Audio using `assets/GeneralUser-GS.sf2` loaded through Tampermonkey `GM_getResourceURL`, so playback works on browsers that do not expose compatible native MIDI output.
+Tampermonkey userscript that overrides `navigator.requestMIDIAccess()` with a virtual Web MIDI output. MIDI messages are rendered through Web Audio using `assets/GeneralUser-GS.sf2`, downloaded on first use with a bottom-center progress bar and cached in IndexedDB for later loads.
 
 ## Install
 
 [Install the latest userscript from GitHub raw](https://raw.githubusercontent.com/fred913/midi-sf2-web/main/dist/sf2.user.js).
 
-The compiled userscript is `dist/sf2.user.js`. It includes the userscript header and references the SoundFont with `@resource GENERAL_USER_GS_SF2`; Tampermonkey caches that file outside the script body.
+The compiled userscript is `dist/sf2.user.js`. The SoundFont is not embedded in the script body; the runtime downloads it from this repository's GitHub raw URL and stores it in a local IndexedDB cache.
 
 ## Build
 
@@ -43,6 +43,8 @@ Open `http://127.0.0.1:4173/demo/index.html`, initialize the shim, then play C4 
 The shim implements an output-only Web MIDI surface with `MIDIAccess.sysexEnabled`, `onstatechange`, `MIDIPort.open()`, `MIDIPort.close()`, queued `MIDIOutput.send(data, timestamp)`, and `MIDIOutput.clear()`. The bundle also exposes `WebMidiAudioShim.playMidiFile(arrayBuffer)`, which uses a lookahead scheduler for Standard MIDI files and recognizes common GM/GS reset messages.
 
 Playback is capped to avoid runaway CPU on dense files: defaults are `maxVoices: 96`, `maxVoicesPerChannel: 32`, and `maxMessagesPerTick: 4096`. `playMidiFile()` also accepts `lookaheadMs`, `schedulerIntervalMs`, and `maxEventsPerTick` overrides for tuning.
+
+The SoundFont cache can be cleared with `WebMidiAudioShim.clearSoundFontCache()` or `WebMidiAudioShim.getInstalledWebMidiAudioShim().clearSoundFontCache()`.
 
 ## License
 

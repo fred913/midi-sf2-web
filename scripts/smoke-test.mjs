@@ -131,10 +131,73 @@ class FakeAudioContext {
   }
 }
 
+function createFakeIndexedDB() {
+  const stores = new Map()
+
+  function asyncRequest(result, apply) {
+    const request = {}
+    setTimeout(() => {
+      try {
+        if (apply) {
+          apply()
+        }
+        request.result = result
+        request.onsuccess?.({ target: request })
+      } catch (error) {
+        request.error = error
+        request.onerror?.({ target: request })
+      }
+    }, 0)
+    return request
+  }
+
+  function createStore(name) {
+    if (!stores.has(name)) {
+      stores.set(name, new Map())
+    }
+    const store = stores.get(name)
+    return {
+      get: (key) => asyncRequest(store.get(key)),
+      put: (record) => asyncRequest(record.key, () => store.set(record.key, record)),
+      delete: (key) => asyncRequest(undefined, () => store.delete(key))
+    }
+  }
+
+  function createDb() {
+    return {
+      objectStoreNames: {
+        contains: (name) => stores.has(name)
+      },
+      createObjectStore: (name) => createStore(name),
+      transaction: (name) => ({
+        objectStore: () => createStore(name)
+      }),
+      close() {}
+    }
+  }
+
+  return {
+    open() {
+      const request = {}
+      setTimeout(() => {
+        const db = createDb()
+        request.result = db
+        if (!stores.has("soundfonts")) {
+          request.onupgradeneeded?.({ target: request })
+        }
+        request.onsuccess?.({ target: request })
+      }, 0)
+      return request
+    }
+  }
+}
+
 function loadBundle({ fakeClock = true } = {}) {
   const code = fs.readFileSync("dist/sf2.user.js", "utf8")
   const soundFontBytes = fs.readFileSync("assets/GeneralUser-GS.sf2")
+  const soundFontUrl = "https://raw.githubusercontent.com/fred913/midi-sf2-web/main/assets/GeneralUser-GS.sf2"
   let now = 0
+  let fetchCount = 0
   const context = {
     AudioContext: FakeAudioContext,
     Buffer,
@@ -145,15 +208,16 @@ function loadBundle({ fakeClock = true } = {}) {
     navigator: {},
     setInterval,
     setTimeout,
-    GM_getResourceURL: (name) => {
-      assert.equal(name, "GENERAL_USER_GS_SF2")
-      return "tampermonkey-resource://GENERAL_USER_GS_SF2"
-    },
+    indexedDB: createFakeIndexedDB(),
     fetch: async (url) => {
-      assert.equal(url, "tampermonkey-resource://GENERAL_USER_GS_SF2")
+      fetchCount += 1
+      assert.equal(url, soundFontUrl)
       return {
         ok: true,
         status: 200,
+        headers: {
+          get: (name) => name.toLowerCase() === "content-length" ? String(soundFontBytes.byteLength) : null
+        },
         arrayBuffer: async () => soundFontBytes.buffer.slice(
           soundFontBytes.byteOffset,
           soundFontBytes.byteOffset + soundFontBytes.byteLength
@@ -165,6 +229,7 @@ function loadBundle({ fakeClock = true } = {}) {
   context.advanceClock = (ms) => {
     now += ms
   }
+  context.fetchCount = () => fetchCount
   vm.createContext(context)
   vm.runInContext(code, context)
   context.WebMidiAudioShim.installWebMidiAudioShim({ navigator: context.navigator })
@@ -239,7 +304,7 @@ async function testSendValidationAndQueue() {
   assert.equal(output.queue.length, 0)
 }
 
-async function testResourceDeferredSend() {
+async function testDeferredSendWhileSoundFontDownloads() {
   const context = loadBundle()
   const access = await context.navigator.requestMIDIAccess()
   const output = outputFrom(access)
@@ -250,6 +315,23 @@ async function testResourceDeferredSend() {
   await output.preload()
   assert.equal(shim.synth.channels[0].activeNotes.get(60).length, 1)
   output.clear()
+}
+
+async function testIndexedDbSoundFontCache() {
+  const context = loadBundle()
+  let shim = context.WebMidiAudioShim.getInstalledWebMidiAudioShim()
+
+  await shim.preload()
+  assert.equal(context.fetchCount(), 1)
+
+  shim = context.WebMidiAudioShim.installWebMidiAudioShim({ navigator: context.navigator, force: true })
+  await shim.preload()
+  assert.equal(context.fetchCount(), 1)
+
+  await shim.clearSoundFontCache()
+  shim = context.WebMidiAudioShim.installWebMidiAudioShim({ navigator: context.navigator, force: true })
+  await shim.preload()
+  assert.equal(context.fetchCount(), 2)
 }
 
 async function testMidiAndResetMessages() {
@@ -339,7 +421,8 @@ async function testEmbeddedSoundFontStillLoads() {
 
 await testAccessAndPortState()
 await testSendValidationAndQueue()
-await testResourceDeferredSend()
+await testDeferredSendWhileSoundFontDownloads()
+await testIndexedDbSoundFontCache()
 await testMidiAndResetMessages()
 await testLazySharedModulationLfo()
 await testMidiParserAndPlayback()
