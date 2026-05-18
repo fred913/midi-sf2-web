@@ -366,19 +366,20 @@ async function testCustomSoundFontDevices() {
     source: "file"
   })
   assert.equal(installed.name, "Second Piano")
-  assert.equal(installed.selected, true)
   assert.equal(shim.listSoundFontDevices().length, 2)
 
   const access = await context.navigator.requestMIDIAccess()
   assert.equal(access.outputs.size, 2)
-  assert.equal(access.outputs.values().next().value.id, installed.id)
+  const outputs = Array.from(access.outputs.values())
+  assert.equal(outputs[0].id, "generaluser-gs-web-audio")
+  assert.equal(outputs[1].id, installed.id)
+
+  await outputs[1].preload()
+  assert.equal(outputs[1].synth.ensureSoundFont().getPreset(0, 0).name, "Grand Piano")
 
   const renamed = await shim.renameSoundFontDevice(installed.id, "Renamed Piano")
   assert.equal(renamed.name, "Renamed Piano")
   assert.equal(access.outputs.get(installed.id).name, "Renamed Piano")
-
-  await shim.selectSoundFontDevice("generaluser-gs-web-audio")
-  assert.equal(shim.listSoundFontDevices()[0].builtIn, true)
 
   assert.equal(await shim.uninstallSoundFont(installed.id), true)
   assert.equal(shim.listSoundFontDevices().length, 1)

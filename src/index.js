@@ -3,7 +3,6 @@ const DEFAULT_SOUNDFONT_URL = "https://raw.githubusercontent.com/fred913/midi-sf
 const DEFAULT_SOUNDFONT_CACHE_KEY = "GeneralUser-GS-v2.0.3";
 const SOUNDFONT_CACHE_DB = "midi-sf2-web";
 const SOUNDFONT_CACHE_STORE = "soundfonts";
-const SOUNDFONT_SETTINGS_KEY = "__settings__";
 const CUSTOM_SOUNDFONT_PREFIX = "custom-sf2-";
 const MIDI_CHANNELS = 16;
 const PERCUSSION_CHANNEL = 9;
@@ -95,34 +94,21 @@ export function installWebMidiAudioShim(options = {}) {
     synth: defaultSynth
   };
   const devices = new Map([[defaultDevice.id, defaultDevice]]);
-  let selectedDeviceId = defaultDevice.id;
   const accessBySysex = new Map();
 
   function orderedDevices() {
-    const result = [];
-    const selected = devices.get(selectedDeviceId);
-    if (selected) {
-      result.push(selected);
-    }
-    for (const device of devices.values()) {
-      if (device.id !== selectedDeviceId) {
-        result.push(device);
-      }
-    }
-    return result;
+    return Array.from(devices.values());
   }
 
   function syncDeviceToAccesses(device) {
     for (const access of accessBySysex.values()) {
       access.addOutputDevice(device);
-      access.orderOutputs(selectedDeviceId);
     }
   }
 
   function removeDeviceFromAccesses(deviceId) {
     for (const access of accessBySysex.values()) {
       access.removeOutputDevice(deviceId);
-      access.orderOutputs(selectedDeviceId);
     }
   }
 
@@ -154,17 +140,6 @@ export function installWebMidiAudioShim(options = {}) {
     devices.set(device.id, device);
     syncDeviceToAccesses(device);
     return device;
-  }
-
-  function selectDevice(deviceId, persist = true) {
-    selectedDeviceId = devices.has(deviceId) ? deviceId : defaultDevice.id;
-    for (const access of accessBySysex.values()) {
-      access.orderOutputs(selectedDeviceId);
-    }
-    if (persist) {
-      writeSoundFontSettings({ selectedDeviceId });
-    }
-    return devices.get(selectedDeviceId);
   }
 
   function getAccess(requestOptions = {}) {
@@ -208,17 +183,13 @@ export function installWebMidiAudioShim(options = {}) {
       installedShim = null;
     },
     preload() {
-      return devices.get(selectedDeviceId)?.synth.preload() || defaultSynth.preload();
+      return defaultSynth.preload();
     },
     clearSoundFontCache() {
-      return devices.get(selectedDeviceId)?.synth.clearCache() || defaultSynth.clearCache();
+      return defaultSynth.clearCache();
     },
     listSoundFontDevices() {
-      return orderedDevices().map((device) => publicSoundFontDevice(device, device.id === selectedDeviceId));
-    },
-    selectSoundFontDevice(deviceId) {
-      const device = selectDevice(deviceId);
-      return Promise.resolve(publicSoundFontDevice(device, true));
+      return orderedDevices().map((device) => publicSoundFontDevice(device));
     },
     async installSoundFontFromArrayBuffer(arrayBuffer, metadata = {}) {
       const key = metadata.key || createCustomSoundFontKey(metadata.name || metadata.fileName || metadata.url || "Custom SF2");
@@ -235,8 +206,7 @@ export function installWebMidiAudioShim(options = {}) {
         source: metadata.source || "file",
         url: metadata.url || ""
       });
-      selectDevice(device.id);
-      return publicSoundFontDevice(device, true);
+      return publicSoundFontDevice(device);
     },
     async installSoundFontFromUrl(url, metadata = {}) {
       const progress = createSoundFontProgressOverlay();
@@ -256,9 +226,6 @@ export function installWebMidiAudioShim(options = {}) {
       device.synth.clear();
       devices.delete(deviceId);
       await deleteCachedSoundFont(device.key);
-      if (selectedDeviceId === deviceId) {
-        selectDevice(defaultDevice.id);
-      }
       removeDeviceFromAccesses(deviceId);
       return true;
     },
@@ -271,7 +238,7 @@ export function installWebMidiAudioShim(options = {}) {
       device.name = cleanName;
       await updateCachedSoundFontMetadata(device.key, { name: cleanName });
       renameDeviceInAccesses(deviceId, cleanName);
-      return publicSoundFontDevice(device, device.id === selectedDeviceId);
+      return publicSoundFontDevice(device);
     },
     openSettings() {
       openSoundFontSettingsPanel(installedShim);
@@ -282,12 +249,6 @@ export function installWebMidiAudioShim(options = {}) {
     .then((records) => {
       for (const record of records) {
         registerCustomSoundFont(record);
-      }
-      return readSoundFontSettings();
-    })
-    .then((settings) => {
-      if (settings?.selectedDeviceId) {
-        selectDevice(settings.selectedDeviceId, false);
       }
     })
     .catch(() => {
@@ -619,20 +580,6 @@ class VirtualMIDIAccess extends SimpleEventTarget {
     }
     output.name = name;
     output.emitStateChange();
-  }
-
-  orderOutputs(selectedDeviceId) {
-    if (!this.outputs.has(selectedDeviceId)) {
-      return;
-    }
-    const selected = this.outputs.get(selectedDeviceId);
-    const reordered = new Map([[selectedDeviceId, selected]]);
-    for (const [id, output] of this.outputs) {
-      if (id !== selectedDeviceId) {
-        reordered.set(id, output);
-      }
-    }
-    this.outputs = reordered;
   }
 
   emitPortStateChange(port) {
@@ -1574,16 +1521,16 @@ class EmbeddedSoundFontSynth {
       return base64ToArrayBuffer(this.soundFontBase64);
     }
 
-    const url = this.resolveSoundFontUrl();
-    if (!url) {
-      throw new Error("No SoundFont source is available. Pass soundFontUrl or soundFontBase64.");
-    }
-
     if (this.cacheSoundFont) {
       const cached = await readCachedSoundFont(this.soundFontCacheKey);
       if (cached) {
         return cached;
       }
+    }
+
+    const url = this.resolveSoundFontUrl();
+    if (!url) {
+      throw new Error("No cached SoundFont data is available for this MIDI output.");
     }
 
     const progress = this.progress || createSoundFontProgressOverlay();
@@ -2194,7 +2141,7 @@ function chooseOlderVoice(a, b) {
   return b.startedAt < a.startedAt ? b : a;
 }
 
-function publicSoundFontDevice(device, selected = false) {
+function publicSoundFontDevice(device) {
   if (!device) {
     return null;
   }
@@ -2203,8 +2150,7 @@ function publicSoundFontDevice(device, selected = false) {
     key: device.key,
     name: device.name,
     builtIn: !!device.builtIn,
-    source: device.source || "",
-    selected: !!selected
+    source: device.source || ""
   };
 }
 
@@ -2312,39 +2258,6 @@ async function loadInstalledSoundFontRecords() {
     return records.filter((record) => record?.custom && isArrayBuffer(record.data));
   } catch {
     return [];
-  } finally {
-    db.close?.();
-  }
-}
-
-async function readSoundFontSettings() {
-  const db = await openSoundFontCache();
-  if (!db) {
-    return {};
-  }
-  try {
-    const record = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).get(SOUNDFONT_SETTINGS_KEY));
-    return record?.settings || {};
-  } catch {
-    return {};
-  } finally {
-    db.close?.();
-  }
-}
-
-async function writeSoundFontSettings(settings) {
-  const db = await openSoundFontCache();
-  if (!db) {
-    return;
-  }
-  try {
-    await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readwrite").objectStore(SOUNDFONT_CACHE_STORE).put({
-      key: SOUNDFONT_SETTINGS_KEY,
-      settings,
-      updatedAt: Date.now()
-    }));
-  } catch {
-    // Settings are a convenience; MIDI output still works without them.
   } finally {
     db.close?.();
   }
@@ -2624,7 +2537,7 @@ function openSoundFontSettingsPanel(shim) {
 
   const selectFileButton = document.createElement("button");
   selectFileButton.type = "button";
-  selectFileButton.textContent = "Select SF2 file";
+  selectFileButton.textContent = "Install SF2 file";
   selectFileButton.style.cssText = buttonStyle("primary");
   selectFileButton.addEventListener("click", () => fileInput.click());
 
@@ -2688,7 +2601,7 @@ function openSoundFontSettingsPanel(shim) {
       const row = document.createElement("div");
       row.style.cssText = [
         "display:grid",
-        "grid-template-columns:minmax(0,1fr) auto auto auto",
+        "grid-template-columns:minmax(0,1fr) auto auto",
         "gap:8px",
         "align-items:center",
         "border:1px solid #e2e8f0",
@@ -2699,23 +2612,12 @@ function openSoundFontSettingsPanel(shim) {
       const info = document.createElement("div");
       info.style.cssText = "min-width:0";
       const name = document.createElement("div");
-      name.textContent = `${device.selected ? "[selected] " : ""}${device.name}`;
+      name.textContent = device.name;
       name.style.cssText = "font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
       const meta = document.createElement("div");
       meta.textContent = device.builtIn ? "Built-in device" : `Custom device: ${device.id}`;
       meta.style.cssText = "font-size:12px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
       info.append(name, meta);
-
-      const selectButton = document.createElement("button");
-      selectButton.type = "button";
-      selectButton.textContent = "Select";
-      selectButton.disabled = device.selected;
-      selectButton.style.cssText = buttonStyle();
-      selectButton.addEventListener("click", async () => {
-        await shim.selectSoundFontDevice(device.id);
-        setStatus(`Selected ${device.name}`);
-        refreshDevices();
-      });
 
       const renameButton = document.createElement("button");
       renameButton.type = "button";
@@ -2746,7 +2648,7 @@ function openSoundFontSettingsPanel(shim) {
         refreshDevices();
       });
 
-      row.append(info, selectButton, renameButton, removeButton);
+      row.append(info, renameButton, removeButton);
       deviceList.append(row);
     }
   }
