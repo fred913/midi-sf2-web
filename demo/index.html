@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Web MIDI Audio Shim</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f7f8fb;
+        color: #15171a;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 32px;
+      }
+
+      main {
+        width: min(760px, 100%);
+        display: grid;
+        gap: 18px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(28px, 6vw, 54px);
+        line-height: 1;
+        letter-spacing: 0;
+      }
+
+      .panel {
+        background: #ffffff;
+        border: 1px solid #d9dde5;
+        border-radius: 8px;
+        padding: 18px;
+        display: grid;
+        gap: 16px;
+        box-shadow: 0 18px 54px rgba(27, 35, 53, 0.08);
+      }
+
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+      }
+
+      button,
+      label {
+        min-height: 42px;
+        border-radius: 7px;
+        border: 1px solid #c7ccd7;
+        background: #ffffff;
+        color: #16191f;
+        padding: 0 14px;
+        font: inherit;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        cursor: pointer;
+      }
+
+      button.primary {
+        border-color: #116a54;
+        background: #117a5f;
+        color: #ffffff;
+      }
+
+      button:disabled {
+        opacity: 0.48;
+        cursor: not-allowed;
+      }
+
+      input[type="file"] {
+        inline-size: 1px;
+        block-size: 1px;
+        opacity: 0;
+        position: absolute;
+      }
+
+      output {
+        min-height: 24px;
+        color: #4e5664;
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Web MIDI Audio Shim</h1>
+      <section class="panel" aria-label="MIDI controls">
+        <div class="controls">
+          <button class="primary" id="init" type="button">Initialize</button>
+          <button id="note" type="button" disabled>Play C4</button>
+          <label>
+            Open MIDI
+            <input id="file" type="file" accept=".mid,.midi,audio/midi,audio/x-midi">
+          </label>
+          <button id="stop" type="button" disabled>Stop</button>
+        </div>
+        <output id="status">Ready</output>
+      </section>
+    </main>
+
+    <script src="../dist/sf2.user.js"></script>
+    <script>
+      const initButton = document.querySelector("#init");
+      const noteButton = document.querySelector("#note");
+      const fileInput = document.querySelector("#file");
+      const stopButton = document.querySelector("#stop");
+      const statusOutput = document.querySelector("#status");
+
+      let output;
+      let playback;
+
+      initButton.addEventListener("click", async () => {
+        statusOutput.value = "Loading SoundFont";
+        const access = await navigator.requestMIDIAccess();
+        output = access.outputs.values().next().value;
+        await output.open();
+        await output.preload();
+        noteButton.disabled = false;
+        initButton.disabled = true;
+        statusOutput.value = output.name;
+      });
+
+      noteButton.addEventListener("click", () => {
+        output.send([0xc0, 0]);
+        output.send([0x90, 60, 104]);
+        setTimeout(() => output.send([0x80, 60, 0]), 650);
+      });
+
+      fileInput.addEventListener("change", async () => {
+        if (!fileInput.files.length) {
+          return;
+        }
+        if (!output) {
+          initButton.click();
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        playback?.stop();
+        statusOutput.value = fileInput.files[0].name;
+        const buffer = await fileInput.files[0].arrayBuffer();
+        playback = await WebMidiAudioShim.playMidiFile(buffer, { output });
+        stopButton.disabled = false;
+      });
+
+      stopButton.addEventListener("click", () => {
+        playback?.stop();
+        playback = null;
+        stopButton.disabled = true;
+        statusOutput.value = "Stopped";
+      });
+    </script>
+  </body>
+</html>

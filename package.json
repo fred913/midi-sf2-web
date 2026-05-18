@@ -1,0 +1,14 @@
+{
+  "name": "midi-sf2-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Web MIDI API override backed by an embedded SF2 SoundFont and Web Audio.",
+  "scripts": {
+    "build": "node scripts/clean-dist.mjs && rollup -c",
+    "serve": "node scripts/serve-demo.mjs"
+  },
+  "devDependencies": {
+    "rollup": "^4.41.1"
+  }
+}
