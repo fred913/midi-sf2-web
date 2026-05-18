@@ -2304,7 +2304,7 @@ var WebMidiAudioShim = (function (exports) {
       }
 
       const length = midiMessageLength(status);
-      if (!length || offset + length > bytes.length) {
+      if (!length) {
         throw new TypeError("MIDIOutput.send() data contains an incomplete or invalid MIDI message.");
       }
 
@@ -2321,7 +2321,8 @@ var WebMidiAudioShim = (function (exports) {
           continue;
         }
         if (byte >= 0x80) {
-          throw new TypeError("MIDIOutput.send() data contains a status byte before the previous message was complete.");
+          padMIDIMessage(message, length);
+          break;
         }
         message.push(byte);
         offset += 1;
@@ -2334,6 +2335,12 @@ var WebMidiAudioShim = (function (exports) {
 
   function isRealtimeStatus(byte) {
     return byte >= 0xf8 && byte <= 0xff;
+  }
+
+  function padMIDIMessage(message, length) {
+    while (message.length < length) {
+      message.push(0);
+    }
   }
 
   function midiMessageLength(status) {

@@ -295,6 +295,11 @@ async function testSendValidationAndQueue() {
   output.send([0x90, 60, 0xf8, 100])
   assert.equal(context.WebMidiAudioShim.getInstalledWebMidiAudioShim().synth.channels[0].activeNotes.get(60).length, 1)
   output.send([0x80, 60, 0xfe, 0])
+  output.send([0xb0, 7, 0xc0, 5])
+  assert.equal(context.WebMidiAudioShim.getInstalledWebMidiAudioShim().synth.channels[0].volume, 0)
+  assert.equal(context.WebMidiAudioShim.getInstalledWebMidiAudioShim().synth.channels[0].program, 5)
+  output.send([0xc0, 0])
+  output.send([0xb0, 7, 100])
 
   output.send([0x90, 60, 100], 1000)
   assert.equal(context.WebMidiAudioShim.getInstalledWebMidiAudioShim().synth.channels[0].activeNotes.size, 0)
