@@ -3,6 +3,8 @@ const DEFAULT_SOUNDFONT_URL = "https://raw.githubusercontent.com/fred913/midi-sf
 const DEFAULT_SOUNDFONT_CACHE_KEY = "GeneralUser-GS-v2.0.3";
 const SOUNDFONT_CACHE_DB = "midi-sf2-web";
 const SOUNDFONT_CACHE_STORE = "soundfonts";
+const SOUNDFONT_SETTINGS_KEY = "__settings__";
+const CUSTOM_SOUNDFONT_PREFIX = "custom-sf2-";
 const MIDI_CHANNELS = 16;
 const PERCUSSION_CHANNEL = 9;
 const DEFAULT_PITCH_BEND_RANGE = 2;
@@ -76,7 +78,7 @@ export function installWebMidiAudioShim(options = {}) {
   }
 
   const previousRequestMIDIAccess = targetNavigator.requestMIDIAccess;
-  const synth = new EmbeddedSoundFontSynth({
+  const defaultSynth = new EmbeddedSoundFontSynth({
     audioContext: options.audioContext,
     soundFontBase64: options.soundFontBase64,
     soundFontUrl: options.soundFontUrl,
@@ -85,12 +87,90 @@ export function installWebMidiAudioShim(options = {}) {
     progress: options.progress,
     masterGain: options.masterGain
   });
+  const defaultDevice = {
+    id: options.outputId || DEFAULT_OUTPUT_ID,
+    key: DEFAULT_SOUNDFONT_CACHE_KEY,
+    name: options.outputName || "GeneralUser GS Web Audio",
+    builtIn: true,
+    synth: defaultSynth
+  };
+  const devices = new Map([[defaultDevice.id, defaultDevice]]);
+  let selectedDeviceId = defaultDevice.id;
   const accessBySysex = new Map();
+
+  function orderedDevices() {
+    const result = [];
+    const selected = devices.get(selectedDeviceId);
+    if (selected) {
+      result.push(selected);
+    }
+    for (const device of devices.values()) {
+      if (device.id !== selectedDeviceId) {
+        result.push(device);
+      }
+    }
+    return result;
+  }
+
+  function syncDeviceToAccesses(device) {
+    for (const access of accessBySysex.values()) {
+      access.addOutputDevice(device);
+      access.orderOutputs(selectedDeviceId);
+    }
+  }
+
+  function removeDeviceFromAccesses(deviceId) {
+    for (const access of accessBySysex.values()) {
+      access.removeOutputDevice(deviceId);
+      access.orderOutputs(selectedDeviceId);
+    }
+  }
+
+  function renameDeviceInAccesses(deviceId, name) {
+    for (const access of accessBySysex.values()) {
+      access.renameOutputDevice(deviceId, name);
+    }
+  }
+
+  function registerCustomSoundFont(record) {
+    if (!record?.key || devices.has(record.key)) {
+      return null;
+    }
+    const device = {
+      id: record.key,
+      key: record.key,
+      name: record.name || record.key,
+      builtIn: false,
+      source: record.source || "",
+      synth: new EmbeddedSoundFontSynth({
+        audioContext: options.audioContext,
+        soundFontUrl: record.url || null,
+        soundFontCacheKey: record.key,
+        cacheSoundFont: true,
+        progress: options.progress === false ? false : null,
+        masterGain: options.masterGain
+      })
+    };
+    devices.set(device.id, device);
+    syncDeviceToAccesses(device);
+    return device;
+  }
+
+  function selectDevice(deviceId, persist = true) {
+    selectedDeviceId = devices.has(deviceId) ? deviceId : defaultDevice.id;
+    for (const access of accessBySysex.values()) {
+      access.orderOutputs(selectedDeviceId);
+    }
+    if (persist) {
+      writeSoundFontSettings({ selectedDeviceId });
+    }
+    return devices.get(selectedDeviceId);
+  }
 
   function getAccess(requestOptions = {}) {
     const sysexEnabled = !!requestOptions.sysex;
     if (!accessBySysex.has(sysexEnabled)) {
-      accessBySysex.set(sysexEnabled, new VirtualMIDIAccess(synth, {
+      accessBySysex.set(sysexEnabled, new VirtualMIDIAccess(orderedDevices(), {
         ...options,
         sysexEnabled,
         lookaheadMs: options.lookaheadMs ?? DEFAULT_LOOKAHEAD_MS,
@@ -112,7 +192,7 @@ export function installWebMidiAudioShim(options = {}) {
       return getAccess();
     },
     getAccess,
-    synth,
+    synth: defaultSynth,
     previousRequestMIDIAccess,
     restore() {
       for (const access of accessBySysex.values()) {
@@ -128,12 +208,93 @@ export function installWebMidiAudioShim(options = {}) {
       installedShim = null;
     },
     preload() {
-      return synth.preload();
+      return devices.get(selectedDeviceId)?.synth.preload() || defaultSynth.preload();
     },
     clearSoundFontCache() {
-      return synth.clearCache();
+      return devices.get(selectedDeviceId)?.synth.clearCache() || defaultSynth.clearCache();
+    },
+    listSoundFontDevices() {
+      return orderedDevices().map((device) => publicSoundFontDevice(device, device.id === selectedDeviceId));
+    },
+    selectSoundFontDevice(deviceId) {
+      const device = selectDevice(deviceId);
+      return Promise.resolve(publicSoundFontDevice(device, true));
+    },
+    async installSoundFontFromArrayBuffer(arrayBuffer, metadata = {}) {
+      const key = metadata.key || createCustomSoundFontKey(metadata.name || metadata.fileName || metadata.url || "Custom SF2");
+      const name = cleanSoundFontName(metadata.name || metadata.fileName || metadata.url || "Custom SF2");
+      await writeCachedSoundFont(key, arrayBuffer, {
+        ...metadata,
+        key,
+        name,
+        custom: true
+      });
+      const device = registerCustomSoundFont({
+        key,
+        name,
+        source: metadata.source || "file",
+        url: metadata.url || ""
+      });
+      selectDevice(device.id);
+      return publicSoundFontDevice(device, true);
+    },
+    async installSoundFontFromUrl(url, metadata = {}) {
+      const progress = createSoundFontProgressOverlay();
+      const arrayBuffer = await downloadSoundFont(url, progress);
+      return this.installSoundFontFromArrayBuffer(arrayBuffer, {
+        ...metadata,
+        name: metadata.name || fileNameFromUrl(url) || "Remote SF2",
+        source: "url",
+        url
+      });
+    },
+    async uninstallSoundFont(deviceId) {
+      const device = devices.get(deviceId);
+      if (!device || device.builtIn) {
+        return false;
+      }
+      device.synth.clear();
+      devices.delete(deviceId);
+      await deleteCachedSoundFont(device.key);
+      if (selectedDeviceId === deviceId) {
+        selectDevice(defaultDevice.id);
+      }
+      removeDeviceFromAccesses(deviceId);
+      return true;
+    },
+    async renameSoundFontDevice(deviceId, name) {
+      const device = devices.get(deviceId);
+      if (!device || device.builtIn) {
+        return null;
+      }
+      const cleanName = cleanSoundFontName(name);
+      device.name = cleanName;
+      await updateCachedSoundFontMetadata(device.key, { name: cleanName });
+      renameDeviceInAccesses(deviceId, cleanName);
+      return publicSoundFontDevice(device, device.id === selectedDeviceId);
+    },
+    openSettings() {
+      openSoundFontSettingsPanel(installedShim);
     }
   };
+
+  loadInstalledSoundFontRecords()
+    .then((records) => {
+      for (const record of records) {
+        registerCustomSoundFont(record);
+      }
+      return readSoundFontSettings();
+    })
+    .then((settings) => {
+      if (settings?.selectedDeviceId) {
+        selectDevice(settings.selectedDeviceId, false);
+      }
+    })
+    .catch(() => {
+      // Settings should never block MIDI installation.
+    });
+
+  registerSettingsMenu(installedShim);
 
   return installedShim;
 }
@@ -404,23 +565,74 @@ class SimpleEventTarget {
 }
 
 class VirtualMIDIAccess extends SimpleEventTarget {
-  constructor(synth, options) {
+  constructor(devices, options) {
     super();
     this.sysexEnabled = !!options.sysexEnabled;
     this.inputs = new Map();
     this.outputs = new Map();
+    this.outputOptions = options;
 
-    const output = new VirtualMIDIOutput(synth, {
+    for (const device of devices) {
+      this.addOutputDevice(device, false);
+    }
+  }
+
+  addOutputDevice(device, notify = true) {
+    if (!device || this.outputs.has(device.id)) {
+      return;
+    }
+
+    const output = new VirtualMIDIOutput(device.synth, {
       access: this,
-      id: options.outputId || DEFAULT_OUTPUT_ID,
-      manufacturer: options.manufacturer || "midi-sf2-web",
-      name: options.outputName || "GeneralUser GS Web Audio",
+      id: device.id,
+      manufacturer: this.outputOptions.manufacturer || "midi-sf2-web",
+      name: device.name,
       sysexEnabled: this.sysexEnabled,
-      lookaheadMs: options.lookaheadMs ?? DEFAULT_LOOKAHEAD_MS,
-      schedulerIntervalMs: options.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS,
-      maxMessagesPerTick: options.maxMessagesPerTick ?? DEFAULT_MAX_MESSAGES_PER_TICK
+      lookaheadMs: this.outputOptions.lookaheadMs ?? DEFAULT_LOOKAHEAD_MS,
+      schedulerIntervalMs: this.outputOptions.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS,
+      maxMessagesPerTick: this.outputOptions.maxMessagesPerTick ?? DEFAULT_MAX_MESSAGES_PER_TICK
     });
+    output.builtIn = !!device.builtIn;
+    output.soundFontKey = device.key;
     this.outputs.set(output.id, output);
+    if (notify) {
+      this.emitPortStateChange(output);
+    }
+  }
+
+  removeOutputDevice(deviceId) {
+    const output = this.outputs.get(deviceId);
+    if (!output) {
+      return;
+    }
+    output.clear();
+    output.state = "disconnected";
+    output.connection = "closed";
+    this.outputs.delete(deviceId);
+    this.emitPortStateChange(output);
+  }
+
+  renameOutputDevice(deviceId, name) {
+    const output = this.outputs.get(deviceId);
+    if (!output) {
+      return;
+    }
+    output.name = name;
+    output.emitStateChange();
+  }
+
+  orderOutputs(selectedDeviceId) {
+    if (!this.outputs.has(selectedDeviceId)) {
+      return;
+    }
+    const selected = this.outputs.get(selectedDeviceId);
+    const reordered = new Map([[selectedDeviceId, selected]]);
+    for (const [id, output] of this.outputs) {
+      if (id !== selectedDeviceId) {
+        reordered.set(id, output);
+      }
+    }
+    this.outputs = reordered;
   }
 
   emitPortStateChange(port) {
@@ -601,7 +813,7 @@ class LookaheadScheduler {
 class EmbeddedSoundFontSynth {
   constructor(options = {}) {
     this.soundFontBase64 = options.soundFontBase64 || null;
-    this.soundFontUrl = options.soundFontUrl || DEFAULT_SOUNDFONT_URL;
+    this.soundFontUrl = options.soundFontUrl === undefined ? DEFAULT_SOUNDFONT_URL : options.soundFontUrl;
     this.soundFontCacheKey = options.soundFontCacheKey || DEFAULT_SOUNDFONT_CACHE_KEY;
     this.cacheSoundFont = options.cacheSoundFont !== false;
     this.progress = options.progress === false ? null : options.progress || null;
@@ -1401,11 +1613,18 @@ class EmbeddedSoundFontSynth {
   }
 
   clearCache() {
+    this.clear();
+    return deleteCachedSoundFont(this.soundFontCacheKey);
+  }
+
+  clear() {
+    if (this.audioContext) {
+      this.allSoundOff();
+    }
     this.soundFont = null;
     this.soundFontPromise = null;
     this.pendingMidi.length = 0;
     this.sampleBufferCache.clear();
-    return deleteCachedSoundFont(this.soundFontCacheKey);
   }
 }
 
@@ -1975,6 +2194,53 @@ function chooseOlderVoice(a, b) {
   return b.startedAt < a.startedAt ? b : a;
 }
 
+function publicSoundFontDevice(device, selected = false) {
+  if (!device) {
+    return null;
+  }
+  return {
+    id: device.id,
+    key: device.key,
+    name: device.name,
+    builtIn: !!device.builtIn,
+    source: device.source || "",
+    selected: !!selected
+  };
+}
+
+function createCustomSoundFontKey(name) {
+  return `${CUSTOM_SOUNDFONT_PREFIX}${Date.now()}-${simpleHash(name).toString(36)}`;
+}
+
+function simpleHash(value) {
+  let hash = 2166136261;
+  const text = String(value || "");
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function cleanSoundFontName(name) {
+  const text = String(name || "Custom SF2")
+    .replace(/\.(sf2|sf3)$/i, "")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text || "Custom SF2";
+}
+
+function fileNameFromUrl(url) {
+  try {
+    const base = typeof location !== "undefined" ? location.href : "https://example.invalid/";
+    const pathname = new URL(url, base).pathname;
+    return decodeURIComponent(pathname.split("/").filter(Boolean).pop() || "");
+  } catch {
+    return String(url || "").split("/").filter(Boolean).pop() || "";
+  }
+}
+
 async function downloadSoundFont(url, progress) {
   const fetchFn = typeof fetch === "function" ? fetch : pageGlobalThis()?.fetch?.bind(pageGlobalThis());
   if (typeof fetchFn !== "function") {
@@ -2036,6 +2302,54 @@ async function readCachedSoundFont(key) {
   }
 }
 
+async function loadInstalledSoundFontRecords() {
+  const db = await openSoundFontCache();
+  if (!db) {
+    return [];
+  }
+  try {
+    const records = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).getAll());
+    return records.filter((record) => record?.custom && isArrayBuffer(record.data));
+  } catch {
+    return [];
+  } finally {
+    db.close?.();
+  }
+}
+
+async function readSoundFontSettings() {
+  const db = await openSoundFontCache();
+  if (!db) {
+    return {};
+  }
+  try {
+    const record = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).get(SOUNDFONT_SETTINGS_KEY));
+    return record?.settings || {};
+  } catch {
+    return {};
+  } finally {
+    db.close?.();
+  }
+}
+
+async function writeSoundFontSettings(settings) {
+  const db = await openSoundFontCache();
+  if (!db) {
+    return;
+  }
+  try {
+    await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readwrite").objectStore(SOUNDFONT_CACHE_STORE).put({
+      key: SOUNDFONT_SETTINGS_KEY,
+      settings,
+      updatedAt: Date.now()
+    }));
+  } catch {
+    // Settings are a convenience; MIDI output still works without them.
+  } finally {
+    db.close?.();
+  }
+}
+
 async function writeCachedSoundFont(key, arrayBuffer, metadata = {}) {
   const db = await openSoundFontCache();
   if (!db) {
@@ -2046,11 +2360,37 @@ async function writeCachedSoundFont(key, arrayBuffer, metadata = {}) {
       key,
       data: arrayBuffer,
       byteLength: arrayBuffer.byteLength,
+      name: metadata.name || key,
+      custom: !!metadata.custom,
+      source: metadata.source || "",
       url: metadata.url || "",
       updatedAt: Date.now()
     }));
   } catch {
     // Playback still works without a persistent cache.
+  } finally {
+    db.close?.();
+  }
+}
+
+async function updateCachedSoundFontMetadata(key, metadata = {}) {
+  const db = await openSoundFontCache();
+  if (!db) {
+    return;
+  }
+  try {
+    const record = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).get(key));
+    if (!record) {
+      return;
+    }
+    await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readwrite").objectStore(SOUNDFONT_CACHE_STORE).put({
+      ...record,
+      ...metadata,
+      key,
+      updatedAt: Date.now()
+    }));
+  } catch {
+    // Runtime device names remain usable even if metadata persistence fails.
   } finally {
     db.close?.();
   }
@@ -2216,6 +2556,258 @@ function noopProgress() {
   };
 }
 
+function openSoundFontSettingsPanel(shim) {
+  if (typeof document === "undefined" || typeof document.createElement !== "function") {
+    return;
+  }
+
+  const existing = document.getElementById("web-midi-sf2-settings");
+  if (existing) {
+    existing.remove();
+  }
+
+  const host = document.createElement("div");
+  host.id = "web-midi-sf2-settings";
+  host.style.cssText = [
+    "position:fixed",
+    "inset:0",
+    "z-index:2147483646",
+    "background:rgba(0,0,0,0.42)",
+    "display:flex",
+    "align-items:center",
+    "justify-content:center",
+    "padding:18px",
+    "box-sizing:border-box",
+    "font:14px/1.4 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+    "color:#111"
+  ].join(";");
+
+  const panel = document.createElement("div");
+  panel.style.cssText = [
+    "width:min(680px,100%)",
+    "max-height:min(760px,calc(100vh - 36px))",
+    "overflow:auto",
+    "box-sizing:border-box",
+    "border-radius:8px",
+    "background:#fff",
+    "box-shadow:0 20px 60px rgba(0,0,0,0.34)",
+    "padding:18px"
+  ].join(";");
+
+  const titleRow = document.createElement("div");
+  titleRow.style.cssText = "display:flex;align-items:center;gap:12px;margin-bottom:14px";
+  const title = document.createElement("div");
+  title.textContent = "SF2 MIDI devices";
+  title.style.cssText = "font-size:18px;font-weight:700;flex:1";
+  const closeButton = document.createElement("button");
+  closeButton.type = "button";
+  closeButton.textContent = "Close";
+  closeButton.style.cssText = buttonStyle();
+  closeButton.addEventListener("click", () => host.remove());
+  titleRow.append(title, closeButton);
+
+  const dropZone = document.createElement("div");
+  dropZone.style.cssText = [
+    "border:1px dashed #8aa0b8",
+    "border-radius:8px",
+    "padding:18px",
+    "background:#f8fafc",
+    "text-align:center",
+    "margin-bottom:12px"
+  ].join(";");
+  dropZone.textContent = "Drop an .sf2 file here";
+
+  const fileInput = document.createElement("input");
+  fileInput.type = "file";
+  fileInput.accept = ".sf2,.sf3,audio/x-soundfont";
+  fileInput.style.display = "none";
+
+  const selectFileButton = document.createElement("button");
+  selectFileButton.type = "button";
+  selectFileButton.textContent = "Select SF2 file";
+  selectFileButton.style.cssText = buttonStyle("primary");
+  selectFileButton.addEventListener("click", () => fileInput.click());
+
+  const urlRow = document.createElement("div");
+  urlRow.style.cssText = "display:flex;gap:8px;margin:12px 0 16px;align-items:center";
+  const urlInput = document.createElement("input");
+  urlInput.type = "url";
+  urlInput.placeholder = "Paste SF2 URL";
+  urlInput.style.cssText = [
+    "flex:1",
+    "box-sizing:border-box",
+    "border:1px solid #cbd5e1",
+    "border-radius:6px",
+    "padding:8px 10px",
+    "font:inherit"
+  ].join(";");
+  const installUrlButton = document.createElement("button");
+  installUrlButton.type = "button";
+  installUrlButton.textContent = "Install URL";
+  installUrlButton.style.cssText = buttonStyle();
+  urlRow.append(urlInput, installUrlButton);
+
+  const status = document.createElement("div");
+  status.style.cssText = "min-height:20px;color:#475569;margin-bottom:10px";
+
+  const devicesTitle = document.createElement("div");
+  devicesTitle.textContent = "Installed MIDI devices";
+  devicesTitle.style.cssText = "font-weight:700;margin:12px 0 8px";
+
+  const deviceList = document.createElement("div");
+  deviceList.style.cssText = "display:flex;flex-direction:column;gap:8px";
+
+  async function installFile(file) {
+    if (!file) {
+      return;
+    }
+    setStatus(`Installing ${file.name}...`);
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      await shim.installSoundFontFromArrayBuffer(arrayBuffer, {
+        fileName: file.name,
+        name: file.name,
+        source: "file"
+      });
+      setStatus(`Installed ${file.name}`);
+      refreshDevices();
+    } catch (error) {
+      setStatus(error?.message || "Install failed", true);
+    }
+  }
+
+  function setStatus(message, error = false) {
+    status.textContent = message;
+    status.style.color = error ? "#be123c" : "#475569";
+  }
+
+  function refreshDevices() {
+    deviceList.replaceChildren();
+    const devices = shim.listSoundFontDevices();
+    for (const device of devices) {
+      const row = document.createElement("div");
+      row.style.cssText = [
+        "display:grid",
+        "grid-template-columns:minmax(0,1fr) auto auto auto",
+        "gap:8px",
+        "align-items:center",
+        "border:1px solid #e2e8f0",
+        "border-radius:8px",
+        "padding:10px"
+      ].join(";");
+
+      const info = document.createElement("div");
+      info.style.cssText = "min-width:0";
+      const name = document.createElement("div");
+      name.textContent = `${device.selected ? "[selected] " : ""}${device.name}`;
+      name.style.cssText = "font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+      const meta = document.createElement("div");
+      meta.textContent = device.builtIn ? "Built-in device" : `Custom device: ${device.id}`;
+      meta.style.cssText = "font-size:12px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+      info.append(name, meta);
+
+      const selectButton = document.createElement("button");
+      selectButton.type = "button";
+      selectButton.textContent = "Select";
+      selectButton.disabled = device.selected;
+      selectButton.style.cssText = buttonStyle();
+      selectButton.addEventListener("click", async () => {
+        await shim.selectSoundFontDevice(device.id);
+        setStatus(`Selected ${device.name}`);
+        refreshDevices();
+      });
+
+      const renameButton = document.createElement("button");
+      renameButton.type = "button";
+      renameButton.textContent = "Rename";
+      renameButton.disabled = device.builtIn;
+      renameButton.style.cssText = buttonStyle();
+      renameButton.addEventListener("click", async () => {
+        const nextName = prompt("Device name", device.name);
+        if (!nextName) {
+          return;
+        }
+        await shim.renameSoundFontDevice(device.id, nextName);
+        setStatus("Renamed device");
+        refreshDevices();
+      });
+
+      const removeButton = document.createElement("button");
+      removeButton.type = "button";
+      removeButton.textContent = "Uninstall";
+      removeButton.disabled = device.builtIn;
+      removeButton.style.cssText = buttonStyle("danger");
+      removeButton.addEventListener("click", async () => {
+        if (!confirm(`Uninstall ${device.name}?`)) {
+          return;
+        }
+        await shim.uninstallSoundFont(device.id);
+        setStatus("Uninstalled device");
+        refreshDevices();
+      });
+
+      row.append(info, selectButton, renameButton, removeButton);
+      deviceList.append(row);
+    }
+  }
+
+  dropZone.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    dropZone.style.background = "#e0f2fe";
+  });
+  dropZone.addEventListener("dragleave", () => {
+    dropZone.style.background = "#f8fafc";
+  });
+  dropZone.addEventListener("drop", (event) => {
+    event.preventDefault();
+    dropZone.style.background = "#f8fafc";
+    installFile(event.dataTransfer?.files?.[0]);
+  });
+  fileInput.addEventListener("change", () => installFile(fileInput.files?.[0]));
+  installUrlButton.addEventListener("click", async () => {
+    const url = urlInput.value.trim();
+    if (!url) {
+      setStatus("Paste an SF2 URL first.", true);
+      return;
+    }
+    setStatus("Downloading SF2...");
+    try {
+      await shim.installSoundFontFromUrl(url);
+      setStatus("Installed URL SF2");
+      urlInput.value = "";
+      refreshDevices();
+    } catch (error) {
+      setStatus(error?.message || "Install failed", true);
+    }
+  });
+  host.addEventListener("click", (event) => {
+    if (event.target === host) {
+      host.remove();
+    }
+  });
+
+  panel.append(titleRow, dropZone, selectFileButton, fileInput, urlRow, status, devicesTitle, deviceList);
+  host.append(panel);
+  document.documentElement.appendChild(host);
+  refreshDevices();
+}
+
+function buttonStyle(variant = "normal") {
+  const background = variant === "primary" ? "#0f172a" : variant === "danger" ? "#fff1f2" : "#fff";
+  const color = variant === "primary" ? "#fff" : variant === "danger" ? "#be123c" : "#0f172a";
+  const border = variant === "primary" ? "#0f172a" : variant === "danger" ? "#fecdd3" : "#cbd5e1";
+  return [
+    "box-sizing:border-box",
+    `background:${background}`,
+    `color:${color}`,
+    `border:1px solid ${border}`,
+    "border-radius:6px",
+    "padding:7px 10px",
+    "font:inherit",
+    "cursor:pointer"
+  ].join(";");
+}
+
 function formatBytes(bytes) {
   if (bytes < 1024) {
     return `${bytes} B`;
@@ -2224,6 +2816,15 @@ function formatBytes(bytes) {
     return `${(bytes / 1024).toFixed(1)} KB`;
   }
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function registerSettingsMenu(shim) {
+  const register = typeof GM_registerMenuCommand === "function"
+    ? GM_registerMenuCommand
+    : globalThis.GM_registerMenuCommand;
+  if (typeof register === "function") {
+    register("SF2 Settings", () => shim.openSettings());
+  }
 }
 
 function eventSortOrder(event) {

@@ -159,7 +159,8 @@ function createFakeIndexedDB() {
     return {
       get: (key) => asyncRequest(store.get(key)),
       put: (record) => asyncRequest(record.key, () => store.set(record.key, record)),
-      delete: (key) => asyncRequest(undefined, () => store.delete(key))
+      delete: (key) => asyncRequest(undefined, () => store.delete(key)),
+      getAll: () => asyncRequest(Array.from(store.values()))
     }
   }
 
@@ -198,6 +199,7 @@ function loadBundle({ fakeClock = true } = {}) {
   const soundFontUrl = "https://raw.githubusercontent.com/fred913/midi-sf2-web/main/assets/GeneralUser-GS.sf2"
   let now = 0
   let fetchCount = 0
+  const menuCommands = []
   const context = {
     AudioContext: FakeAudioContext,
     Buffer,
@@ -208,6 +210,9 @@ function loadBundle({ fakeClock = true } = {}) {
     navigator: {},
     setInterval,
     setTimeout,
+    GM_registerMenuCommand: (name, callback) => {
+      menuCommands.push({ name, callback })
+    },
     indexedDB: createFakeIndexedDB(),
     fetch: async (url) => {
       fetchCount += 1
@@ -230,6 +235,7 @@ function loadBundle({ fakeClock = true } = {}) {
     now += ms
   }
   context.fetchCount = () => fetchCount
+  context.menuCommands = menuCommands
   vm.createContext(context)
   vm.runInContext(code, context)
   context.WebMidiAudioShim.installWebMidiAudioShim({ navigator: context.navigator })
@@ -346,6 +352,39 @@ async function testIndexedDbSoundFontCache() {
   assert.equal(context.fetchCount(), 2)
 }
 
+async function testCustomSoundFontDevices() {
+  const context = loadBundle()
+  const shim = context.WebMidiAudioShim.getInstalledWebMidiAudioShim()
+  const sourceBytes = fs.readFileSync("assets/GeneralUser-GS.sf2")
+  const sourceBuffer = sourceBytes.buffer.slice(sourceBytes.byteOffset, sourceBytes.byteOffset + sourceBytes.byteLength)
+
+  assert.equal(context.menuCommands.some((command) => command.name === "SF2 Settings"), true)
+  assert.equal(shim.listSoundFontDevices().length, 1)
+
+  const installed = await shim.installSoundFontFromArrayBuffer(sourceBuffer, {
+    name: "Second Piano.sf2",
+    source: "file"
+  })
+  assert.equal(installed.name, "Second Piano")
+  assert.equal(installed.selected, true)
+  assert.equal(shim.listSoundFontDevices().length, 2)
+
+  const access = await context.navigator.requestMIDIAccess()
+  assert.equal(access.outputs.size, 2)
+  assert.equal(access.outputs.values().next().value.id, installed.id)
+
+  const renamed = await shim.renameSoundFontDevice(installed.id, "Renamed Piano")
+  assert.equal(renamed.name, "Renamed Piano")
+  assert.equal(access.outputs.get(installed.id).name, "Renamed Piano")
+
+  await shim.selectSoundFontDevice("generaluser-gs-web-audio")
+  assert.equal(shim.listSoundFontDevices()[0].builtIn, true)
+
+  assert.equal(await shim.uninstallSoundFont(installed.id), true)
+  assert.equal(shim.listSoundFontDevices().length, 1)
+  assert.equal(access.outputs.has(installed.id), false)
+}
+
 async function testMidiAndResetMessages() {
   const context = loadBundle()
   const access = await context.navigator.requestMIDIAccess({ sysex: true })
@@ -435,6 +474,7 @@ await testAccessAndPortState()
 await testSendValidationAndQueue()
 await testDeferredSendWhileSoundFontDownloads()
 await testIndexedDbSoundFontCache()
+await testCustomSoundFontDevices()
 await testMidiAndResetMessages()
 await testLazySharedModulationLfo()
 await testMidiParserAndPlayback()
