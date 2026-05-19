@@ -48,7 +48,7 @@ Playback is capped to avoid runaway CPU on dense files: defaults are `maxVoices:
 
 The SoundFont cache can be cleared with `WebMidiAudioShim.clearSoundFontCache()` or `WebMidiAudioShim.getInstalledWebMidiAudioShim().clearSoundFontCache()`.
 
-Tampermonkey's menu exposes `SF2 Settings`. The settings panel can install a new `.sf2` by drag and drop, file picker, or URL; each installed SoundFont appears as a separate virtual MIDI output. Custom devices can be renamed or uninstalled from the panel, while MIDI output selection is left to the page through `MIDIAccess.outputs`.
+Tampermonkey's menu exposes `SF2 Settings`. The settings panel can install a new `.sf2` by drag and drop, file picker, or URL; each installed SoundFont appears as a separate virtual MIDI output. It also shows live per-device performance counters for MIDI events per second, played notes per second, dropped events, dropped notes, and active voices. Custom devices can be renamed or uninstalled from the panel, while MIDI output selection is left to the page through `MIDIAccess.outputs`.
 
 ## License
 

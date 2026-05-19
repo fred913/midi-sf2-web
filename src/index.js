@@ -208,6 +208,9 @@ export function installWebMidiAudioShim(options = {}) {
     setMasterGain(value) {
       return applyMasterGain(value);
     },
+    getPerformanceStats() {
+      return aggregatePerformanceStats(orderedDevices());
+    },
     listSoundFontDevices() {
       return orderedDevices().map((device) => publicSoundFontDevice(device));
     },
@@ -651,6 +654,7 @@ class VirtualMIDIOutput extends SimpleEventTarget {
 
   close() {
     if (this.connection !== "closed") {
+      this.recordDroppedQueuedEvents();
       this.queue.length = 0;
       this.scheduler.stop();
       this.connection = "closed";
@@ -674,9 +678,16 @@ class VirtualMIDIOutput extends SimpleEventTarget {
 
     const now = performanceNow();
     for (const item of items) {
-      const messages = parseMIDIMessageSequence(item.data, this.sysexEnabled);
+      let messages;
+      try {
+        messages = parseMIDIMessageSequence(item.data, this.sysexEnabled);
+      } catch (error) {
+        this.synth.recordDroppedMidiEvents(1);
+        throw error;
+      }
       const timestampNumber = Number(item.timestamp || 0);
       if (!Number.isFinite(timestampNumber) || timestampNumber < 0) {
+        this.synth.recordDroppedMidiEvents(messages.length || 1);
         throw new TypeError("MIDIOutput.send() timestamp must be a finite non-negative number.");
       }
 
@@ -716,6 +727,7 @@ class VirtualMIDIOutput extends SimpleEventTarget {
   }
 
   clear() {
+    this.recordDroppedQueuedEvents();
     this.queue.length = 0;
     this.scheduler.stop();
     this.synth.allSoundOff();
@@ -752,6 +764,12 @@ class VirtualMIDIOutput extends SimpleEventTarget {
     this.dispatchEvent(createMIDIConnectionEvent(this));
     if (this.access) {
       this.access.emitPortStateChange(this);
+    }
+  }
+
+  recordDroppedQueuedEvents() {
+    if (this.queue.length) {
+      this.synth.recordDroppedMidiEvents(this.queue.length);
     }
   }
 }
@@ -799,6 +817,7 @@ class EmbeddedSoundFontSynth {
     this.masterGain = null;
     this.limiter = null;
     this.sampleBufferCache = new Map();
+    this.performanceStats = createPerformanceStats();
     this.maxVoices = positiveIntegerOrDefault(options.maxVoices, DEFAULT_MAX_VOICES);
     this.maxVoicesPerChannel = positiveIntegerOrDefault(options.maxVoicesPerChannel, DEFAULT_MAX_VOICES_PER_CHANNEL);
     this.channels = Array.from({ length: MIDI_CHANNELS }, (_, index) => createChannelState(index));
@@ -827,6 +846,7 @@ class EmbeddedSoundFontSynth {
   }
 
   dispatchLoadedMidi(bytes, delaySeconds = 0) {
+    this.recordMidiEvents(1);
     const status = bytes[0];
     if (status >= 0xf0) {
       this.dispatchSystemMessage(bytes, delaySeconds);
@@ -931,6 +951,40 @@ class EmbeddedSoundFontSynth {
     }
   }
 
+  recordMidiEvents(count = 1) {
+    incrementPerformanceStat(this.performanceStats, "midiEvents", count);
+  }
+
+  recordDroppedMidiEvents(count = 1) {
+    incrementPerformanceStat(this.performanceStats, "droppedMidiEvents", count);
+  }
+
+  recordPlayedNotes(count = 1) {
+    incrementPerformanceStat(this.performanceStats, "playedNotes", count);
+  }
+
+  recordDroppedNotes(count = 1) {
+    incrementPerformanceStat(this.performanceStats, "droppedNotes", count);
+  }
+
+  getPerformanceStats() {
+    return {
+      ...this.performanceStats,
+      activeNotes: this.countActiveNotes(),
+      activeVoices: this.countManagedVoices(),
+      pendingMidi: this.pendingMidi.length,
+      sampleBuffers: this.sampleBufferCache.size
+    };
+  }
+
+  countActiveNotes() {
+    let count = 0;
+    for (const channel of this.channels) {
+      count += channel.activeNotes.size;
+    }
+    return count;
+  }
+
   noteOn(channelIndex, note, velocity, delaySeconds = 0) {
     const soundFont = this.ensureSoundFont();
     const context = this.ensureAudioContext();
@@ -938,11 +992,13 @@ class EmbeddedSoundFontSynth {
     const bank = channelIndex === PERCUSSION_CHANNEL ? 128 : channel.bankMsb;
     const preset = soundFont.getPreset(bank, channel.program) || soundFont.getPreset(0, channel.program) || soundFont.getPreset(0, 0);
     if (!preset) {
+      this.recordDroppedNotes(1);
       return;
     }
 
     const regions = soundFont.getPresetRegions(preset).filter((region) => regionMatches(region, note, velocity));
     if (!regions.length) {
+      this.recordDroppedNotes(1);
       return;
     }
 
@@ -961,6 +1017,7 @@ class EmbeddedSoundFontSynth {
     }
 
     if (!voices.length) {
+      this.recordDroppedNotes(1);
       return;
     }
 
@@ -970,7 +1027,8 @@ class EmbeddedSoundFontSynth {
     for (const voice of voices) {
       channel.activeVoices.add(voice);
     }
-    this.enforceVoiceLimits(channel, startTime);
+    this.recordPlayedNotes(1);
+    this.recordDroppedNotes(this.enforceVoiceLimits(channel, startTime));
   }
 
   noteOff(channelIndex, note, delaySeconds = 0) {
@@ -1268,12 +1326,14 @@ class EmbeddedSoundFontSynth {
   }
 
   enforceVoiceLimits(channel, when) {
+    let dropped = 0;
     while (countManagedVoices(channel.activeVoices) > this.maxVoicesPerChannel) {
       const voice = selectVoiceToStop(channel.activeVoices);
       if (!voice) {
         break;
       }
       voice.release(when, true);
+      dropped += 1;
     }
 
     while (this.countManagedVoices() > this.maxVoices) {
@@ -1282,7 +1342,9 @@ class EmbeddedSoundFontSynth {
         break;
       }
       voice.release(when, true);
+      dropped += 1;
     }
+    return dropped;
   }
 
   countManagedVoices() {
@@ -2204,6 +2266,47 @@ function publicSoundFontDevice(device) {
   };
 }
 
+function createPerformanceStats() {
+  return {
+    midiEvents: 0,
+    playedNotes: 0,
+    droppedMidiEvents: 0,
+    droppedNotes: 0
+  };
+}
+
+function incrementPerformanceStat(stats, key, count = 1) {
+  const amount = Math.max(0, Math.floor(Number(count) || 0));
+  if (amount) {
+    stats[key] += amount;
+  }
+}
+
+function aggregatePerformanceStats(devices) {
+  const totals = {
+    ...createPerformanceStats(),
+    activeNotes: 0,
+    activeVoices: 0,
+    pendingMidi: 0,
+    sampleBuffers: 0
+  };
+  const deviceStats = devices.map((device) => {
+    const stats = device.synth.getPerformanceStats();
+    for (const key of Object.keys(totals)) {
+      totals[key] += stats[key] || 0;
+    }
+    return {
+      ...publicSoundFontDevice(device),
+      stats
+    };
+  });
+  return {
+    updatedAt: performanceNow(),
+    totals,
+    devices: deviceStats
+  };
+}
+
 function createCustomSoundFontKey(name) {
   return `${CUSTOM_SOUNDFONT_PREFIX}${Date.now()}-${simpleHash(name).toString(36)}`;
 }
@@ -2563,6 +2666,7 @@ function openSoundFontSettingsPanel(shim) {
 
   const existing = document.getElementById("web-midi-sf2-settings");
   if (existing) {
+    existing.__webMidiSf2Cleanup?.();
     existing.remove();
   }
 
@@ -2603,8 +2707,21 @@ function openSoundFontSettingsPanel(shim) {
   closeButton.type = "button";
   closeButton.textContent = "Close";
   closeButton.style.cssText = buttonStyle();
-  closeButton.addEventListener("click", () => host.remove());
   titleRow.append(title, closeButton);
+
+  let statsTimer = null;
+
+  function closePanel() {
+    if (statsTimer != null) {
+      clearInterval(statsTimer);
+      statsTimer = null;
+    }
+    host.__webMidiSf2Cleanup = null;
+    host.remove();
+  }
+
+  host.__webMidiSf2Cleanup = closePanel;
+  closeButton.addEventListener("click", closePanel);
 
   const gainRow = document.createElement("label");
   gainRow.style.cssText = [
@@ -2637,6 +2754,87 @@ function openSoundFontSettingsPanel(shim) {
   });
   refreshGainValue();
   gainRow.append(gainLabel, gainInput, gainValue);
+
+  const performanceSection = document.createElement("div");
+  performanceSection.style.cssText = [
+    "border:1px solid #e2e8f0",
+    "border-radius:8px",
+    "padding:10px",
+    "margin-bottom:14px",
+    "background:#f8fafc"
+  ].join(";");
+  const performanceTitle = document.createElement("div");
+  performanceTitle.textContent = "MIDI performance";
+  performanceTitle.style.cssText = "font-weight:700;margin-bottom:8px";
+  const performanceRows = document.createElement("div");
+  performanceRows.style.cssText = "display:flex;flex-direction:column;gap:4px";
+  performanceSection.append(performanceTitle, performanceRows);
+
+  let lastPerformanceSnapshot = null;
+
+  function refreshPerformanceStats() {
+    const snapshot = shim.getPerformanceStats();
+    const previous = lastPerformanceSnapshot;
+    const elapsedSeconds = previous ? Math.max(0.001, (snapshot.updatedAt - previous.updatedAt) / 1000) : 1;
+    const previousById = new Map((previous?.devices || []).map((device) => [device.id, device]));
+    performanceRows.replaceChildren();
+    performanceRows.append(createPerformanceHeaderRow());
+    performanceRows.append(createPerformanceRow("Total", snapshot.totals, previous?.totals, elapsedSeconds, true));
+    for (const device of snapshot.devices) {
+      performanceRows.append(createPerformanceRow(device.name, device.stats, previousById.get(device.id)?.stats, elapsedSeconds, false));
+    }
+    lastPerformanceSnapshot = snapshot;
+  }
+
+  function createPerformanceHeaderRow() {
+    const row = document.createElement("div");
+    row.style.cssText = performanceRowStyle(true);
+    for (const text of ["Device", "Events/s", "Notes/s", "Drop evt/s", "Drop notes/s", "Voices"]) {
+      const cell = document.createElement("div");
+      cell.textContent = text;
+      cell.style.cssText = "font-size:11px;color:#64748b;font-weight:700";
+      row.append(cell);
+    }
+    return row;
+  }
+
+  function createPerformanceRow(name, stats, previousStats, elapsedSeconds, total = false) {
+    const row = document.createElement("div");
+    row.style.cssText = performanceRowStyle(false);
+    const previousForRate = previousStats || stats;
+    const nameCell = document.createElement("div");
+    nameCell.textContent = name;
+    nameCell.style.cssText = [
+      "min-width:0",
+      "overflow:hidden",
+      "text-overflow:ellipsis",
+      "white-space:nowrap",
+      total ? "font-weight:700" : "font-weight:600"
+    ].join(";");
+    row.append(
+      nameCell,
+      performanceMetricCell(formatRate(perSecond(stats.midiEvents, previousForRate.midiEvents, elapsedSeconds))),
+      performanceMetricCell(formatRate(perSecond(stats.playedNotes, previousForRate.playedNotes, elapsedSeconds))),
+      performanceMetricCell(formatRate(perSecond(stats.droppedMidiEvents, previousForRate.droppedMidiEvents, elapsedSeconds)), stats.droppedMidiEvents > previousForRate.droppedMidiEvents),
+      performanceMetricCell(formatRate(perSecond(stats.droppedNotes, previousForRate.droppedNotes, elapsedSeconds)), stats.droppedNotes > previousForRate.droppedNotes),
+      performanceMetricCell(String(stats.activeVoices || 0))
+    );
+    return row;
+  }
+
+  function performanceMetricCell(text, warning = false) {
+    const cell = document.createElement("div");
+    cell.textContent = text;
+    cell.style.cssText = [
+      "font-variant-numeric:tabular-nums",
+      "text-align:right",
+      warning ? "color:#be123c;font-weight:700" : "color:#0f172a"
+    ].join(";");
+    return cell;
+  }
+
+  refreshPerformanceStats();
+  statsTimer = setInterval(refreshPerformanceStats, 1000);
 
   const dropZone = document.createElement("div");
   dropZone.style.cssText = [
@@ -2703,6 +2901,7 @@ function openSoundFontSettingsPanel(shim) {
       });
       setStatus(`Installed ${file.name}`);
       refreshDevices();
+      refreshPerformanceStats();
     } catch (error) {
       setStatus(error?.message || "Install failed", true);
     }
@@ -2751,6 +2950,7 @@ function openSoundFontSettingsPanel(shim) {
         await shim.renameSoundFontDevice(device.id, nextName);
         setStatus("Renamed device");
         refreshDevices();
+        refreshPerformanceStats();
       });
 
       const removeButton = document.createElement("button");
@@ -2765,6 +2965,7 @@ function openSoundFontSettingsPanel(shim) {
         await shim.uninstallSoundFont(device.id);
         setStatus("Uninstalled device");
         refreshDevices();
+        refreshPerformanceStats();
       });
 
       row.append(info, renameButton, removeButton);
@@ -2797,17 +2998,18 @@ function openSoundFontSettingsPanel(shim) {
       setStatus("Installed URL SF2");
       urlInput.value = "";
       refreshDevices();
+      refreshPerformanceStats();
     } catch (error) {
       setStatus(error?.message || "Install failed", true);
     }
   });
   host.addEventListener("click", (event) => {
     if (event.target === host) {
-      host.remove();
+      closePanel();
     }
   });
 
-  panel.append(titleRow, gainRow, dropZone, selectFileButton, fileInput, urlRow, status, devicesTitle, deviceList);
+  panel.append(titleRow, gainRow, performanceSection, dropZone, selectFileButton, fileInput, urlRow, status, devicesTitle, deviceList);
   host.append(panel);
   document.documentElement.appendChild(host);
   refreshDevices();
@@ -2827,6 +3029,31 @@ function buttonStyle(variant = "normal") {
     "font:inherit",
     "cursor:pointer"
   ].join(";");
+}
+
+function performanceRowStyle(header = false) {
+  return [
+    "display:grid",
+    "grid-template-columns:minmax(92px,1.4fr) repeat(5,minmax(54px,auto))",
+    "gap:8px",
+    "align-items:center",
+    "font-size:12px",
+    header ? "padding-bottom:2px" : "padding:3px 0"
+  ].join(";");
+}
+
+function perSecond(current = 0, previous = 0, elapsedSeconds = 1) {
+  return Math.max(0, (current - previous) / Math.max(0.001, elapsedSeconds));
+}
+
+function formatRate(value) {
+  if (value >= 100) {
+    return String(Math.round(value));
+  }
+  if (value >= 10) {
+    return value.toFixed(1);
+  }
+  return value.toFixed(2);
 }
 
 function formatBytes(bytes) {

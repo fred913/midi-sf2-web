@@ -261,6 +261,12 @@ function outputFrom(access) {
   return access.outputs.values().next().value
 }
 
+function testUserscriptHeader() {
+  const code = fs.readFileSync("dist/sf2.user.js", "utf8")
+  assert.match(code, /@name\s+SF2 as MIDI out/)
+  assert.match(code, /@match\s+\*:\/\/\*\/\*/)
+}
+
 function makeMidiFile() {
   const track = [
     0x00, 0xf0, 0x05, 0x7e, 0x7f, 0x09, 0x01, 0xf7,
@@ -355,6 +361,42 @@ async function testMasterGainControls() {
   assert.equal(shim.setMasterGain(2), 1.5)
   assert.equal(output.synth.masterGain.gain.value, 1.5)
   assert.equal(shim.setMasterGain("bad"), 1.5)
+}
+
+async function testPerformanceStats() {
+  const context = loadBundle()
+  const access = await context.navigator.requestMIDIAccess()
+  const output = outputFrom(access)
+  const shim = context.WebMidiAudioShim.getInstalledWebMidiAudioShim()
+  await output.preload()
+
+  let stats = shim.getPerformanceStats()
+  assert.equal(stats.totals.midiEvents, 0)
+  assert.equal(stats.totals.playedNotes, 0)
+  assert.equal(stats.totals.droppedMidiEvents, 0)
+  assert.equal(stats.totals.droppedNotes, 0)
+  assert.equal(stats.devices.length, 1)
+
+  output.send([0x90, 60, 100])
+  output.send([0xb0, 7, 90])
+  assert.throws(() => output.send([0x90, 60, 300]), /0x00 and 0xFF/)
+
+  stats = shim.getPerformanceStats()
+  assert.equal(stats.totals.midiEvents, 2)
+  assert.equal(stats.totals.playedNotes, 1)
+  assert.equal(stats.totals.droppedMidiEvents, 1)
+  assert.equal(stats.devices[0].stats.activeVoices, 1)
+
+  output.synth.maxVoices = 4
+  output.synth.maxVoicesPerChannel = 4
+  for (let i = 0; i < 7; i += 1) {
+    output.send([0x90, 62 + i, 100])
+  }
+
+  stats = shim.getPerformanceStats()
+  assert.equal(stats.totals.playedNotes, 8)
+  assert.ok(stats.totals.droppedNotes >= 4)
+  assert.ok(stats.totals.activeVoices <= 4)
 }
 
 async function testDeferredSendWhileSoundFontDownloads() {
@@ -506,9 +548,11 @@ async function testEmbeddedSoundFontStillLoads() {
   assert.equal(preset.name, "Grand Piano")
 }
 
+testUserscriptHeader()
 await testAccessAndPortState()
 await testSendValidationAndQueue()
 await testMasterGainControls()
+await testPerformanceStats()
 await testDeferredSendWhileSoundFontDownloads()
 await testIndexedDbSoundFontCache()
 await testCustomSoundFontDevices()
