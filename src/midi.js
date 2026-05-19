@@ -1,5 +1,4 @@
 import { GS_RESET_PREFIX } from "./constants.js";
-import { createDOMException } from "./utils.js";
 
 export function parseMidiFile(arrayBuffer) {
   const view = new DataView(arrayBuffer);
@@ -186,9 +185,6 @@ export function parseMIDIMessageSequence(data, sysexEnabled) {
       const end = bytes.indexOf(0xf7, offset + 1);
       if (end === -1) {
         throw new TypeError("System Exclusive messages must terminate with 0xF7.");
-      }
-      if (!sysexEnabled) {
-        throw createDOMException("InvalidAccessError", "System Exclusive access was not enabled.");
       }
       messages.push(bytes.slice(offset, end + 1));
       offset = end + 1;

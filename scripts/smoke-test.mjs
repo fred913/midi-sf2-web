@@ -316,7 +316,8 @@ async function testSendValidationAndQueue() {
   await output.preload()
 
   assert.throws(() => output.send([0x40, 0x7f]), /Running status/)
-  assert.throws(() => output.send([0xf0, 0x7e, 0x7f, 0x09, 0x01, 0xf7]), /System Exclusive/)
+  assert.doesNotThrow(() => output.send([0xf0, 0x7e, 0x7f, 0x09, 0x01, 0xf7]))
+  assert.doesNotThrow(() => output.send([0xf0, 0x7d, 0x00, 0xf7]))
   assert.throws(() => output.send([0x90, 60, 300]), /0x00 and 0xFF/)
 
   output.send([0x90, 62])

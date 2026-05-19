@@ -508,9 +508,6 @@ var WebMidiAudioShim = (function (exports) {
         if (end === -1) {
           throw new TypeError("System Exclusive messages must terminate with 0xF7.");
         }
-        if (!sysexEnabled) {
-          throw createDOMException("InvalidAccessError", "System Exclusive access was not enabled.");
-        }
         messages.push(bytes.slice(offset, end + 1));
         offset = end + 1;
         continue;
