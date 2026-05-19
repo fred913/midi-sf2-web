@@ -429,8 +429,8 @@ async function testVoiceLimitControls() {
   const output = outputFrom(access)
 
   let limits = shim.getVoiceLimits()
-  assert.equal(limits.maxVoices, 192)
-  assert.equal(limits.maxVoicesPerChannel, 64)
+  assert.equal(limits.maxVoices, 512)
+  assert.equal(limits.maxVoicesPerChannel, 256)
 
   limits = shim.setVoiceLimits({ maxVoices: 16, maxVoicesPerChannel: 9 })
   assert.equal(limits.maxVoices, 16)
@@ -477,6 +477,28 @@ async function testPerformanceStats() {
   assert.equal(stats.totals.playedNotes, 8)
   assert.ok(stats.totals.droppedNotes >= 4)
   assert.ok(stats.totals.activeVoices <= 4)
+}
+
+async function testDefaultLimitsAllowDenseNoteBursts() {
+  const context = loadBundle()
+  const access = await context.navigator.requestMIDIAccess()
+  const output = outputFrom(access)
+  const shim = context.WebMidiAudioShim.getInstalledWebMidiAudioShim()
+  await output.preload()
+
+  for (let i = 0; i < 200; i += 1) {
+    output.send([0x90, 60 + (i % 12), 100], i * 5)
+  }
+  for (let elapsed = 0; elapsed < 1000; elapsed += 25) {
+    context.advanceClock(25)
+    output.flushQueue()
+  }
+
+  const stats = shim.getPerformanceStats()
+  assert.equal(stats.totals.playedNotes, 200)
+  assert.equal(stats.totals.droppedNotes, 0)
+  assert.ok(stats.totals.activeVoices >= 200)
+  assert.ok(stats.totals.activeVoices <= 256)
 }
 
 async function testDeferredSendWhileSoundFontDownloads() {
@@ -635,6 +657,7 @@ await testMasterGainControls()
 await testPassthroughRealMidiDevices()
 await testVoiceLimitControls()
 await testPerformanceStats()
+await testDefaultLimitsAllowDenseNoteBursts()
 await testDeferredSendWhileSoundFontDownloads()
 await testIndexedDbSoundFontCache()
 await testCustomSoundFontDevices()
