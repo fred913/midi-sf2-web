@@ -20,6 +20,10 @@ npm test
 
 The userscript header version is read from `package.json`. GitHub Actions runs `npm run version:bump-userscript` before its build so each uploaded `dist/sf2.user.js` gets a monotonic patch version such as `0.1.0`, `0.1.1`, and so on.
 
+## Source Layout
+
+`src/index.js` is the public entry point. MIDI parsing lives in `src/midi.js`, Web MIDI port/access shims in `src/web-midi.js`, SoundFont parsing in `src/soundfont.js`, Web Audio synthesis in `src/synth.js`, IndexedDB/download logic in `src/storage.js`, and Tampermonkey UI in `src/ui.js`.
+
 ## Local Demo
 
 ```sh

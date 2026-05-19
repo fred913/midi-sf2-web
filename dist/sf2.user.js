@@ -80,413 +80,246 @@ var WebMidiAudioShim = (function (exports) {
     58: "overridingRootKey"
   };
 
-  let installedShim = null;
+  function scheduleOutputMessages(output, batch) {
+    if (!batch.length) {
+      return;
+    }
+    if (typeof output.scheduleMessages === "function") {
+      output.scheduleMessages(batch);
+      return;
+    }
+    for (const item of batch) {
+      output.send(item.data, item.timestamp);
+    }
+  }
 
-  function installWebMidiAudioShim(options = {}) {
-    const targetNavigator = options.navigator || globalThis.navigator;
-    if (!targetNavigator) {
-      throw new Error("A navigator object is required to install the Web MIDI audio shim.");
+  function compareQueuedMidiMessage(a, b) {
+    return a.timestamp - b.timestamp || a.sequence - b.sequence;
+  }
+
+  function positiveNumberOrDefault(value, defaultValue, minimum = 0) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number <= 0) {
+      return Math.max(minimum, defaultValue);
+    }
+    return Math.max(minimum, number);
+  }
+
+  function positiveIntegerOrDefault(value, defaultValue) {
+    const number = Math.floor(Number(value));
+    if (!Number.isFinite(number) || number <= 0) {
+      return defaultValue;
+    }
+    return number;
+  }
+
+  function createDOMException(name, message) {
+    if (typeof DOMException === "function") {
+      return new DOMException(message, name);
+    }
+    const error = new Error(message);
+    error.name = name;
+    return error;
+  }
+
+  function setAudioParam(param, value, when) {
+    if (typeof param.setTargetAtTime === "function") {
+      param.setTargetAtTime(value, when, 0.01);
+    } else {
+      param.setValueAtTime(value, when);
+    }
+  }
+
+  function setCompressorParam(param, value) {
+    if (param && typeof param.setValueAtTime === "function") {
+      param.setValueAtTime(value, 0);
+    }
+  }
+
+  function normalizeMasterGain(value, fallback) {
+    const gain = Number(value);
+    return Number.isFinite(gain) ? clamp(gain, 0, 1.5) : fallback;
+  }
+
+  function normalizeVoiceLimit(value, fallback, min, max) {
+    const limit = Math.floor(Number(value));
+    return Number.isFinite(limit) ? clamp(limit, min, max) : fallback;
+  }
+
+  function requiredChunk(chunks, name) {
+    const chunk = chunks.get(name);
+    if (!chunk) {
+      throw new Error(`The SF2 file is missing the ${name} chunk.`);
+    }
+    return chunk;
+  }
+
+  function readString(view, offset, length) {
+    let result = "";
+    for (let i = 0; i < length; i += 1) {
+      result += String.fromCharCode(view.getUint8(offset + i));
+    }
+    return result;
+  }
+
+  function readNullTerminatedString(view, offset, length) {
+    return readString(view, offset, length).replace(/\0.*$/, "").trim();
+  }
+
+  function base64ToArrayBuffer(base64) {
+    if (typeof atob === "function") {
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes.buffer;
     }
 
-    if (installedShim && !options.force) {
-      return installedShim;
+    if (typeof Buffer !== "undefined") {
+      const buffer = Buffer.from(base64, "base64");
+      return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
     }
 
-    if (installedShim && options.force) {
-      installedShim.restore();
-    }
+    throw new Error("No base64 decoder is available.");
+  }
 
-    const previousRequestMIDIAccess = targetNavigator.requestMIDIAccess;
-    let masterGainValue = normalizeMasterGain(options.masterGain, DEFAULT_MASTER_GAIN);
-    let passthroughRealMidi = options.passthroughRealMidi !== false;
-    let maxVoicesValue = normalizeVoiceLimit(options.maxVoices, DEFAULT_MAX_VOICES, 8, 512);
-    let maxVoicesPerChannelValue = normalizeVoiceLimit(options.maxVoicesPerChannel, DEFAULT_MAX_VOICES_PER_CHANNEL, 4, 256);
-    maxVoicesValue = Math.max(maxVoicesValue, maxVoicesPerChannelValue);
-    const defaultSynth = new EmbeddedSoundFontSynth({
-      audioContext: options.audioContext,
-      soundFontBase64: options.soundFontBase64,
-      soundFontUrl: options.soundFontUrl,
-      soundFontCacheKey: options.soundFontCacheKey,
-      cacheSoundFont: options.cacheSoundFont,
-      progress: options.progress,
-      masterGain: masterGainValue,
-      maxVoices: maxVoicesValue,
-      maxVoicesPerChannel: maxVoicesPerChannelValue
-    });
-    const defaultDevice = {
-      id: options.outputId || DEFAULT_OUTPUT_ID,
-      key: DEFAULT_SOUNDFONT_CACHE_KEY,
-      name: options.outputName || "GeneralUser GS Web Audio",
-      builtIn: true,
-      synth: defaultSynth
+  function defineRequestMIDIAccess(targetNavigator, requestMIDIAccess) {
+    try {
+      Object.defineProperty(targetNavigator, "requestMIDIAccess", {
+        value: requestMIDIAccess,
+        configurable: true,
+        writable: true
+      });
+    } catch {
+      targetNavigator.requestMIDIAccess = requestMIDIAccess;
+    }
+  }
+
+  function firstMapValue(map) {
+    return map.values().next().value;
+  }
+
+  function midiPortValues(collection) {
+    if (!collection) {
+      return [];
+    }
+    if (typeof collection.values === "function") {
+      return Array.from(collection.values());
+    }
+    if (typeof collection.forEach === "function") {
+      const values = [];
+      collection.forEach((value) => values.push(value));
+      return values;
+    }
+    return [];
+  }
+
+  function validRange(range) {
+    return !range || range[0] <= range[1];
+  }
+
+  function intersectRanges(a, b) {
+    return [Math.max(a[0], b[0]), Math.min(a[1], b[1])];
+  }
+
+  function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+  }
+
+  function performanceNow() {
+    return typeof performance !== "undefined" ? performance.now() : Date.now();
+  }
+
+  function pageGlobalThis() {
+    return typeof unsafeWindow !== "undefined" ? unsafeWindow : globalThis;
+  }
+
+  function publicSoundFontDevice(device) {
+    if (!device) {
+      return null;
+    }
+    return {
+      id: device.id,
+      key: device.key,
+      name: device.name,
+      builtIn: !!device.builtIn,
+      source: device.source || ""
     };
-    const devices = new Map([[defaultDevice.id, defaultDevice]]);
-    const accessBySysex = new Map();
-    const accessRequestOptionsBySysex = new Map();
-    const nativeAccessPromisesBySysex = new Map();
-    let settingsReady = Promise.resolve();
+  }
 
-    function orderedDevices() {
-      return Array.from(devices.values());
+  function createPerformanceStats() {
+    return {
+      midiEvents: 0,
+      playedNotes: 0,
+      droppedMidiEvents: 0,
+      droppedNotes: 0
+    };
+  }
+
+  function incrementPerformanceStat(stats, key, count = 1) {
+    const amount = Math.max(0, Math.floor(Number(count) || 0));
+    if (amount) {
+      stats[key] += amount;
     }
+  }
 
-    function syncDeviceToAccesses(device) {
-      for (const access of accessBySysex.values()) {
-        access.addOutputDevice(device);
-      }
-    }
-
-    function removeDeviceFromAccesses(deviceId) {
-      for (const access of accessBySysex.values()) {
-        access.removeOutputDevice(deviceId);
-      }
-    }
-
-    function renameDeviceInAccesses(deviceId, name) {
-      for (const access of accessBySysex.values()) {
-        access.renameOutputDevice(deviceId, name);
-      }
-    }
-
-    function registerCustomSoundFont(record) {
-      if (!record?.key || devices.has(record.key)) {
-        return null;
-      }
-      const device = {
-        id: record.key,
-        key: record.key,
-        name: record.name || record.key,
-        builtIn: false,
-        source: record.source || "",
-        synth: new EmbeddedSoundFontSynth({
-          audioContext: options.audioContext,
-          soundFontUrl: record.url || null,
-          soundFontCacheKey: record.key,
-          cacheSoundFont: true,
-          progress: options.progress === false ? false : null,
-          masterGain: masterGainValue,
-          maxVoices: maxVoicesValue,
-          maxVoicesPerChannel: maxVoicesPerChannelValue
-        })
-      };
-      devices.set(device.id, device);
-      syncDeviceToAccesses(device);
-      return device;
-    }
-
-    function getAccess(requestOptions = {}) {
-      const sysexEnabled = !!requestOptions.sysex;
-      accessRequestOptionsBySysex.set(sysexEnabled, requestOptions);
-      if (!accessBySysex.has(sysexEnabled)) {
-        accessBySysex.set(sysexEnabled, new VirtualMIDIAccess(orderedDevices(), {
-          ...options,
-          sysexEnabled,
-          lookaheadMs: options.lookaheadMs ?? DEFAULT_LOOKAHEAD_MS,
-          schedulerIntervalMs: options.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS,
-          maxMessagesPerTick: options.maxMessagesPerTick ?? DEFAULT_MAX_MESSAGES_PER_TICK
-        }));
-      }
-      return accessBySysex.get(sysexEnabled);
-    }
-
-    async function requestMIDIAccess(requestOptions = {}) {
-      await settingsReady;
-      const access = getAccess(requestOptions);
-      await syncNativeMIDIAccess(requestOptions, access);
-      return access;
-    }
-
-    function applyMasterGain(value, persist = true) {
-      masterGainValue = normalizeMasterGain(value, masterGainValue);
-      for (const device of devices.values()) {
-        device.synth.setMasterGain(masterGainValue);
-      }
-      if (persist) {
-        writeSoundFontSettings({ masterGain: masterGainValue });
-      }
-      return masterGainValue;
-    }
-
-    async function applyPassthroughRealMidi(enabled, persist = true) {
-      passthroughRealMidi = enabled !== false;
-      if (persist) {
-        writeSoundFontSettings({ passthroughRealMidi });
-      }
-      if (!passthroughRealMidi) {
-        for (const access of accessBySysex.values()) {
-          access.detachNativeAccess();
-        }
-        return passthroughRealMidi;
-      }
-      await syncAllNativeMIDIAccesses();
-      return passthroughRealMidi;
-    }
-
-    function applyVoiceLimits(limits = {}, persist = true) {
-      maxVoicesValue = normalizeVoiceLimit(limits.maxVoices, maxVoicesValue, 8, 512);
-      maxVoicesPerChannelValue = normalizeVoiceLimit(limits.maxVoicesPerChannel, maxVoicesPerChannelValue, 4, 256);
-      if (maxVoicesValue < maxVoicesPerChannelValue) {
-        maxVoicesValue = maxVoicesPerChannelValue;
-      }
-      for (const device of devices.values()) {
-        device.synth.setVoiceLimits(maxVoicesValue, maxVoicesPerChannelValue);
-      }
-      if (persist) {
-        writeSoundFontSettings({
-          maxVoices: maxVoicesValue,
-          maxVoicesPerChannel: maxVoicesPerChannelValue
-        });
+  function aggregatePerformanceStats(devices) {
+    const totals = {
+      ...createPerformanceStats(),
+      activeNotes: 0,
+      activeVoices: 0,
+      pendingMidi: 0,
+      sampleBuffers: 0
+    };
+    const deviceStats = devices.map((device) => {
+      const stats = device.synth.getPerformanceStats();
+      for (const key of Object.keys(totals)) {
+        totals[key] += stats[key] || 0;
       }
       return {
-        maxVoices: maxVoicesValue,
-        maxVoicesPerChannel: maxVoicesPerChannelValue
+        ...publicSoundFontDevice(device),
+        stats
       };
-    }
-
-    async function syncAllNativeMIDIAccesses() {
-      const tasks = [];
-      for (const [sysexEnabled, access] of accessBySysex) {
-        tasks.push(syncNativeMIDIAccess(accessRequestOptionsBySysex.get(sysexEnabled) || { sysex: sysexEnabled }, access));
-      }
-      await Promise.all(tasks);
-    }
-
-    async function syncNativeMIDIAccess(requestOptions = {}, access = getAccess(requestOptions)) {
-      if (!passthroughRealMidi) {
-        access.detachNativeAccess();
-        return access;
-      }
-      if (typeof previousRequestMIDIAccess !== "function") {
-        return access;
-      }
-
-      const sysexEnabled = !!requestOptions.sysex;
-      if (!nativeAccessPromisesBySysex.has(sysexEnabled)) {
-        nativeAccessPromisesBySysex.set(sysexEnabled, Promise.resolve()
-          .then(() => previousRequestMIDIAccess.call(targetNavigator, requestOptions))
-          .catch(() => null));
-      }
-      const nativeAccess = await nativeAccessPromisesBySysex.get(sysexEnabled);
-      if (nativeAccess && passthroughRealMidi) {
-        access.attachNativeAccess(nativeAccess);
-      }
-      return access;
-    }
-
-    defineRequestMIDIAccess(targetNavigator, requestMIDIAccess);
-
-    installedShim = {
-      get access() {
-        return getAccess();
-      },
-      getAccess,
-      synth: defaultSynth,
-      previousRequestMIDIAccess,
-      restore() {
-        for (const access of accessBySysex.values()) {
-          for (const output of access.outputs.values()) {
-            if (typeof output.clear === "function") {
-              output.clear();
-            }
-          }
-          access.detachNativeAccess();
-        }
-        if (previousRequestMIDIAccess) {
-          defineRequestMIDIAccess(targetNavigator, previousRequestMIDIAccess);
-        } else {
-          delete targetNavigator.requestMIDIAccess;
-        }
-        installedShim = null;
-      },
-      preload() {
-        return defaultSynth.preload();
-      },
-      clearSoundFontCache() {
-        return defaultSynth.clearCache();
-      },
-      getMasterGain() {
-        return masterGainValue;
-      },
-      setMasterGain(value) {
-        return applyMasterGain(value);
-      },
-      getPassthroughRealMidi() {
-        return passthroughRealMidi;
-      },
-      setPassthroughRealMidi(enabled) {
-        return applyPassthroughRealMidi(enabled);
-      },
-      getVoiceLimits() {
-        return {
-          maxVoices: maxVoicesValue,
-          maxVoicesPerChannel: maxVoicesPerChannelValue
-        };
-      },
-      setVoiceLimits(limits) {
-        return applyVoiceLimits(limits);
-      },
-      getPerformanceStats() {
-        return aggregatePerformanceStats(orderedDevices());
-      },
-      listSoundFontDevices() {
-        return orderedDevices().map((device) => publicSoundFontDevice(device));
-      },
-      async installSoundFontFromArrayBuffer(arrayBuffer, metadata = {}) {
-        const key = metadata.key || createCustomSoundFontKey(metadata.name || metadata.fileName || metadata.url || "Custom SF2");
-        const name = cleanSoundFontName(metadata.name || metadata.fileName || metadata.url || "Custom SF2");
-        await writeCachedSoundFont(key, arrayBuffer, {
-          ...metadata,
-          key,
-          name,
-          custom: true
-        });
-        const device = registerCustomSoundFont({
-          key,
-          name,
-          source: metadata.source || "file",
-          url: metadata.url || ""
-        });
-        return publicSoundFontDevice(device);
-      },
-      async installSoundFontFromUrl(url, metadata = {}) {
-        const progress = createSoundFontProgressOverlay();
-        const arrayBuffer = await downloadSoundFont(url, progress);
-        return this.installSoundFontFromArrayBuffer(arrayBuffer, {
-          ...metadata,
-          name: metadata.name || fileNameFromUrl(url) || "Remote SF2",
-          source: "url",
-          url
-        });
-      },
-      async uninstallSoundFont(deviceId) {
-        const device = devices.get(deviceId);
-        if (!device || device.builtIn) {
-          return false;
-        }
-        device.synth.clear();
-        devices.delete(deviceId);
-        await deleteCachedSoundFont(device.key);
-        removeDeviceFromAccesses(deviceId);
-        return true;
-      },
-      async renameSoundFontDevice(deviceId, name) {
-        const device = devices.get(deviceId);
-        if (!device || device.builtIn) {
-          return null;
-        }
-        const cleanName = cleanSoundFontName(name);
-        device.name = cleanName;
-        await updateCachedSoundFontMetadata(device.key, { name: cleanName });
-        renameDeviceInAccesses(deviceId, cleanName);
-        return publicSoundFontDevice(device);
-      },
-      openSettings() {
-        openSoundFontSettingsPanel(installedShim);
-      }
-    };
-
-    settingsReady = Promise.all([
-      loadInstalledSoundFontRecords(),
-      options.masterGain === undefined ? readSoundFontSettings() : Promise.resolve({})
-    ])
-      .then(([records, settings]) => {
-        for (const record of records) {
-          registerCustomSoundFont(record);
-        }
-        if (options.masterGain === undefined && settings?.masterGain != null) {
-          applyMasterGain(settings.masterGain, false);
-        }
-        if (options.passthroughRealMidi === undefined && settings?.passthroughRealMidi != null) {
-          applyPassthroughRealMidi(settings.passthroughRealMidi, false);
-        }
-        if ((options.maxVoices === undefined && settings?.maxVoices != null) || (options.maxVoicesPerChannel === undefined && settings?.maxVoicesPerChannel != null)) {
-          applyVoiceLimits({
-            maxVoices: options.maxVoices === undefined ? settings?.maxVoices : maxVoicesValue,
-            maxVoicesPerChannel: options.maxVoicesPerChannel === undefined ? settings?.maxVoicesPerChannel : maxVoicesPerChannelValue
-          }, false);
-        }
-      })
-      .catch(() => {
-        // Settings should never block MIDI installation.
-      });
-
-    registerSettingsMenu(installedShim);
-
-    return installedShim;
-  }
-
-  function getInstalledWebMidiAudioShim() {
-    return installedShim;
-  }
-
-  async function preloadEmbeddedSoundFont() {
-    const shim = installedShim || installWebMidiAudioShim();
-    await shim.preload();
-    return shim.synth;
-  }
-
-  function clearSoundFontCache(cacheKey = DEFAULT_SOUNDFONT_CACHE_KEY) {
-    return deleteCachedSoundFont(cacheKey);
-  }
-
-  async function playMidiFile(arrayBuffer, options = {}) {
-    const events = parseMidiFile(arrayBuffer);
-    const access = options.access || installedShim?.getAccess?.({ sysex: true }) || await navigator.requestMIDIAccess({ sysex: true });
-    const output = options.output || firstMapValue(access.outputs);
-    if (!output) {
-      throw new Error("No MIDI output is available.");
-    }
-    if (typeof output.preload === "function") {
-      await output.preload();
-    }
-
-    const playbackRate = options.playbackRate || 1;
-    const lookaheadMs = positiveNumberOrDefault(options.lookaheadMs, DEFAULT_LOOKAHEAD_MS, MIN_LOOKAHEAD_MS);
-    const schedulerIntervalMs = positiveNumberOrDefault(options.schedulerIntervalMs, DEFAULT_SCHEDULER_INTERVAL_MS, MIN_SCHEDULER_INTERVAL_MS);
-    const maxEventsPerTick = positiveIntegerOrDefault(options.maxEventsPerTick, DEFAULT_MAX_MESSAGES_PER_TICK);
-    const startedAt = performanceNow() + (options.startDelayMs || 0);
-    let cursor = 0;
-    let stopped = false;
-    const scheduler = new LookaheadScheduler({
-      intervalMs: schedulerIntervalMs,
-      onTick() {
-        if (stopped) {
-          return;
-        }
-        const horizon = performanceNow() + lookaheadMs;
-        const batch = [];
-        while (cursor < events.length && batch.length < maxEventsPerTick) {
-          const eventTimestamp = startedAt + events[cursor].timeMs / playbackRate;
-          if (eventTimestamp > horizon) {
-            break;
-          }
-          batch.push({
-            data: events[cursor].data,
-            timestamp: eventTimestamp
-          });
-          cursor += 1;
-        }
-        scheduleOutputMessages(output, batch);
-        if (cursor >= events.length) {
-          scheduler.stop();
-        }
-      }
     });
-
-    scheduler.start();
-    scheduler.tick();
-
     return {
-      durationMs: events.length ? events[events.length - 1].timeMs / playbackRate : 0,
-      startedAt,
-      stop() {
-        stopped = true;
-        scheduler.stop();
-        if (typeof output.clear === "function") {
-          output.clear();
-        }
-      }
+      updatedAt: performanceNow(),
+      totals,
+      devices: deviceStats
     };
+  }
+
+  function createCustomSoundFontKey(name) {
+    return `${CUSTOM_SOUNDFONT_PREFIX}${Date.now()}-${simpleHash(name).toString(36)}`;
+  }
+
+  function simpleHash(value) {
+    let hash = 2166136261;
+    const text = String(value || "");
+    for (let i = 0; i < text.length; i += 1) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return hash >>> 0;
+  }
+
+  function cleanSoundFontName(name) {
+    const text = String(name || "Custom SF2")
+      .replace(/\.(sf2|sf3)$/i, "")
+      .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return text || "Custom SF2";
+  }
+
+  function fileNameFromUrl(url) {
+    try {
+      const base = typeof location !== "undefined" ? location.href : "https://example.invalid/";
+      const pathname = new URL(url, base).pathname;
+      return decodeURIComponent(pathname.split("/").filter(Boolean).pop() || "");
+    } catch {
+      return String(url || "").split("/").filter(Boolean).pop() || "";
+    }
   }
 
   function parseMidiFile(arrayBuffer) {
@@ -635,361 +468,160 @@ var WebMidiAudioShim = (function (exports) {
     return scheduledEvents;
   }
 
-  class SimpleEventTarget {
-    constructor() {
-      this.listeners = new Map();
+  function eventSortOrder(event) {
+    if (event.tempo) {
+      return 0;
+    }
+    if (!event.data) {
+      return 1;
+    }
+    const command = event.data[0] & 0xf0;
+    return command === 0x80 || (command === 0x90 && event.data[2] === 0) ? 1 : 2;
+  }
+
+  function parseMIDIMessageSequence(data, sysexEnabled) {
+    if (data == null || typeof data[Symbol.iterator] !== "function") {
+      throw new TypeError("MIDIOutput.send() data must be an iterable sequence of bytes.");
     }
 
-    addEventListener(type, listener) {
-      const listeners = this.listeners.get(type) || new Set();
-      listeners.add(listener);
-      this.listeners.set(type, listeners);
+    const bytes = Array.from(data, (value) => {
+      const byte = Number(value);
+      if (!Number.isInteger(byte) || byte < 0 || byte > 0xff) {
+        throw new TypeError("MIDIOutput.send() data bytes must be integers between 0x00 and 0xFF.");
+      }
+      return byte;
+    });
+    if (!bytes.length) {
+      throw new TypeError("MIDIOutput.send() data must contain at least one MIDI message.");
     }
 
-    removeEventListener(type, listener) {
-      const listeners = this.listeners.get(type);
-      if (listeners) {
-        listeners.delete(listener);
+    const messages = [];
+    let offset = 0;
+    while (offset < bytes.length) {
+      const status = bytes[offset];
+      if (status < 0x80) {
+        throw new TypeError("Running status is not allowed in MIDIOutput.send() data.");
       }
-    }
 
-    dispatchEvent(event) {
-      if (!event || !event.type) {
-        throw new TypeError("Event object requires a type.");
-      }
-      if (event.timeStamp == null) {
-        event.timeStamp = performanceNow();
-      }
-      event.target = this;
-      event.currentTarget = this;
-      const listeners = this.listeners.get(event.type);
-      if (listeners) {
-        for (const listener of listeners) {
-          if (typeof listener === "function") {
-            listener.call(this, event);
-          } else if (listener && typeof listener.handleEvent === "function") {
-            listener.handleEvent(event);
-          }
+      if (status === 0xf0) {
+        const end = bytes.indexOf(0xf7, offset + 1);
+        if (end === -1) {
+          throw new TypeError("System Exclusive messages must terminate with 0xF7.");
         }
+        if (!sysexEnabled) {
+          throw createDOMException("InvalidAccessError", "System Exclusive access was not enabled.");
+        }
+        messages.push(bytes.slice(offset, end + 1));
+        offset = end + 1;
+        continue;
       }
-      const handler = this[`on${event.type}`];
-      if (typeof handler === "function") {
-        handler.call(this, event);
+
+      if (status === 0xf7) {
+        throw new TypeError("Unexpected System Exclusive terminator.");
       }
-      return true;
+
+      if (isRealtimeStatus(status)) {
+        messages.push([status]);
+        offset += 1;
+        continue;
+      }
+
+      const length = midiMessageLength(status);
+      if (!length) {
+        offset += 1;
+        continue;
+      }
+
+      const message = [status];
+      offset += 1;
+      while (message.length < length) {
+        if (offset >= bytes.length) {
+          padMIDIMessage(message, length);
+          break;
+        }
+        const byte = bytes[offset];
+        if (isRealtimeStatus(byte)) {
+          messages.push([byte]);
+          offset += 1;
+          continue;
+        }
+        if (byte >= 0x80) {
+          padMIDIMessage(message, length);
+          break;
+        }
+        message.push(byte);
+        offset += 1;
+      }
+      messages.push(message);
+    }
+
+    return messages;
+  }
+
+  function isRealtimeStatus(byte) {
+    return byte >= 0xf8 && byte <= 0xff;
+  }
+
+  function padMIDIMessage(message, length) {
+    while (message.length < length) {
+      message.push(0);
     }
   }
 
-  class VirtualMIDIAccess extends SimpleEventTarget {
-    constructor(devices, options) {
-      super();
-      this.sysexEnabled = !!options.sysexEnabled;
-      this.inputs = new Map();
-      this.outputs = new Map();
-      this.outputOptions = options;
-      this.nativeAccess = null;
-      this.nativeInputIds = new Set();
-      this.nativeOutputIds = new Set();
-      this.nativeStateListener = null;
-
-      for (const device of devices) {
-        this.addOutputDevice(device, false);
-      }
+  function midiMessageLength(status) {
+    if (status >= 0x80 && status <= 0xef) {
+      const command = status & 0xf0;
+      return command === 0xc0 || command === 0xd0 ? 2 : 3;
     }
 
-    addOutputDevice(device, notify = true) {
-      if (!device || this.outputs.has(device.id)) {
-        return;
-      }
-
-      const output = new VirtualMIDIOutput(device.synth, {
-        access: this,
-        id: device.id,
-        manufacturer: this.outputOptions.manufacturer || "midi-sf2-web",
-        name: device.name,
-        sysexEnabled: this.sysexEnabled,
-        lookaheadMs: this.outputOptions.lookaheadMs ?? DEFAULT_LOOKAHEAD_MS,
-        schedulerIntervalMs: this.outputOptions.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS,
-        maxMessagesPerTick: this.outputOptions.maxMessagesPerTick ?? DEFAULT_MAX_MESSAGES_PER_TICK
-      });
-      output.builtIn = !!device.builtIn;
-      output.soundFontKey = device.key;
-      this.outputs.set(output.id, output);
-      if (notify) {
-        this.emitPortStateChange(output);
-      }
-    }
-
-    attachNativeAccess(nativeAccess) {
-      if (!nativeAccess) {
-        return;
-      }
-      if (this.nativeAccess && this.nativeAccess !== nativeAccess) {
-        this.detachNativeAccess();
-      }
-      this.nativeAccess = nativeAccess;
-      if (!this.nativeStateListener) {
-        this.nativeStateListener = (event) => {
-          this.syncNativePorts(true);
-          if (event?.port) {
-            this.emitPortStateChange(event.port);
-          }
-        };
-        if (typeof nativeAccess.addEventListener === "function") {
-          nativeAccess.addEventListener("statechange", this.nativeStateListener);
-        }
-      }
-      this.syncNativePorts(true);
-    }
-
-    detachNativeAccess() {
-      if (!this.nativeAccess && !this.nativeInputIds.size && !this.nativeOutputIds.size) {
-        return;
-      }
-      if (this.nativeAccess && this.nativeStateListener && typeof this.nativeAccess.removeEventListener === "function") {
-        this.nativeAccess.removeEventListener("statechange", this.nativeStateListener);
-      }
-      for (const id of this.nativeInputIds) {
-        const port = this.inputs.get(id);
-        this.inputs.delete(id);
-        if (port) {
-          this.emitPortStateChange(port);
-        }
-      }
-      for (const id of this.nativeOutputIds) {
-        const port = this.outputs.get(id);
-        this.outputs.delete(id);
-        if (port) {
-          this.emitPortStateChange(port);
-        }
-      }
-      this.nativeAccess = null;
-      this.nativeStateListener = null;
-      this.nativeInputIds.clear();
-      this.nativeOutputIds.clear();
-    }
-
-    syncNativePorts(notify = true) {
-      if (!this.nativeAccess) {
-        return;
-      }
-      this.syncNativePortMap("inputs", this.nativeAccess.inputs, this.nativeInputIds, notify);
-      this.syncNativePortMap("outputs", this.nativeAccess.outputs, this.nativeOutputIds, notify);
-    }
-
-    syncNativePortMap(kind, source, trackedIds, notify) {
-      const target = this[kind];
-      const seen = new Set();
-      for (const port of midiPortValues(source)) {
-        if (!port?.id) {
-          continue;
-        }
-        seen.add(port.id);
-        if (target.has(port.id) && !trackedIds.has(port.id)) {
-          continue;
-        }
-        const previous = target.get(port.id);
-        target.set(port.id, port);
-        trackedIds.add(port.id);
-        if (notify && previous !== port) {
-          this.emitPortStateChange(port);
-        }
-      }
-      for (const id of Array.from(trackedIds)) {
-        if (seen.has(id)) {
-          continue;
-        }
-        const port = target.get(id);
-        target.delete(id);
-        trackedIds.delete(id);
-        if (notify && port) {
-          this.emitPortStateChange(port);
-        }
-      }
-    }
-
-    removeOutputDevice(deviceId) {
-      const output = this.outputs.get(deviceId);
-      if (!output) {
-        return;
-      }
-      output.clear();
-      output.state = "disconnected";
-      output.connection = "closed";
-      this.outputs.delete(deviceId);
-      this.emitPortStateChange(output);
-    }
-
-    renameOutputDevice(deviceId, name) {
-      const output = this.outputs.get(deviceId);
-      if (!output) {
-        return;
-      }
-      output.name = name;
-      output.emitStateChange();
-    }
-
-    emitPortStateChange(port) {
-      this.dispatchEvent(createMIDIConnectionEvent(port));
+    switch (status) {
+      case 0xf1:
+      case 0xf3:
+        return 2;
+      case 0xf2:
+        return 3;
+      case 0xf6:
+      case 0xf8:
+      case 0xf9:
+      case 0xfa:
+      case 0xfb:
+      case 0xfc:
+      case 0xfd:
+      case 0xfe:
+      case 0xff:
+        return 1;
+      default:
+        return 0;
     }
   }
 
-  class VirtualMIDIOutput extends SimpleEventTarget {
-    constructor(synth, options) {
-      super();
-      this.synth = synth;
-      this.access = options.access;
-      this.id = options.id;
-      this.manufacturer = options.manufacturer;
-      this.name = options.name;
-      this.type = "output";
-      this.version = "0.1.0";
-      this.state = "connected";
-      this.connection = "closed";
-      this.sysexEnabled = !!options.sysexEnabled;
-      this.lookaheadMs = positiveNumberOrDefault(options.lookaheadMs, DEFAULT_LOOKAHEAD_MS, MIN_LOOKAHEAD_MS);
-      this.maxMessagesPerTick = positiveIntegerOrDefault(options.maxMessagesPerTick, DEFAULT_MAX_MESSAGES_PER_TICK);
-      this.queue = [];
-      this.queueSequence = 0;
-      this.scheduler = new LookaheadScheduler({
-        intervalMs: options.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS,
-        onTick: () => this.flushQueue()
-      });
+  function matchesSysex(bytes, pattern) {
+    if (bytes.length !== pattern.length) {
+      return false;
     }
-
-    open() {
-      if (this.state === "disconnected") {
-        this.connection = "pending";
-        this.emitStateChange();
-        return Promise.resolve(this);
-      }
-      if (this.connection !== "open") {
-        this.connection = "open";
-        this.emitStateChange();
-      }
-      return Promise.resolve(this);
-    }
-
-    close() {
-      if (this.connection !== "closed") {
-        this.recordDroppedQueuedEvents();
-        this.queue.length = 0;
-        this.scheduler.stop();
-        this.connection = "closed";
-        this.emitStateChange();
-      }
-      return Promise.resolve(this);
-    }
-
-    send(data, timestamp = 0) {
-      this.scheduleMessages([{ data, timestamp }]);
-    }
-
-    scheduleMessages(items) {
-      if (this.state === "disconnected") {
-        throw createDOMException("InvalidStateError", "Cannot send to a disconnected MIDI output.");
-      }
-
-      if (this.connection === "closed") {
-        this.open();
-      }
-
-      const now = performanceNow();
-      for (const item of items) {
-        let messages;
-        try {
-          messages = parseMIDIMessageSequence(item.data, this.sysexEnabled);
-        } catch (error) {
-          this.synth.recordDroppedMidiEvents(1);
-          throw error;
-        }
-        const timestampNumber = Number(item.timestamp || 0);
-        if (!Number.isFinite(timestampNumber) || timestampNumber < 0) {
-          this.synth.recordDroppedMidiEvents(messages.length || 1);
-          throw new TypeError("MIDIOutput.send() timestamp must be a finite non-negative number.");
-        }
-
-        const sendTimestamp = timestampNumber > now ? timestampNumber : now;
-        for (const message of messages) {
-          this.enqueueMessage(message, sendTimestamp);
-        }
-      }
-      this.flushQueue();
-    }
-
-    enqueueMessage(bytes, timestamp) {
-      const item = {
-        bytes,
-        timestamp,
-        sequence: this.queueSequence
-      };
-      this.queueSequence += 1;
-
-      const last = this.queue[this.queue.length - 1];
-      if (!last || compareQueuedMidiMessage(last, item) <= 0) {
-        this.queue.push(item);
-        return;
-      }
-
-      let low = 0;
-      let high = this.queue.length;
-      while (low < high) {
-        const middle = (low + high) >> 1;
-        if (compareQueuedMidiMessage(this.queue[middle], item) <= 0) {
-          low = middle + 1;
-        } else {
-          high = middle;
-        }
-      }
-      this.queue.splice(low, 0, item);
-    }
-
-    clear() {
-      this.recordDroppedQueuedEvents();
-      this.queue.length = 0;
-      this.scheduler.stop();
-      this.synth.allSoundOff();
-    }
-
-    preload() {
-      return this.synth.preload();
-    }
-
-    flushQueue() {
-      if (!this.queue.length) {
-        this.scheduler.stop();
-        return;
-      }
-
-      const now = performanceNow();
-      const horizon = now + this.lookaheadMs;
-      let sent = 0;
-      while (this.queue.length && this.queue[0].timestamp <= horizon && sent < this.maxMessagesPerTick) {
-        const item = this.queue.shift();
-        const delaySeconds = Math.max(0, (item.timestamp - now) / 1000);
-        this.synth.dispatchMidi(item.bytes, delaySeconds);
-        sent += 1;
-      }
-
-      if (this.queue.length) {
-        this.scheduler.start();
-      } else {
-        this.scheduler.stop();
+    for (let i = 0; i < pattern.length; i += 1) {
+      if (pattern[i] != null && bytes[i] !== pattern[i]) {
+        return false;
       }
     }
+    return true;
+  }
 
-    emitStateChange() {
-      this.dispatchEvent(createMIDIConnectionEvent(this));
-      if (this.access) {
-        this.access.emitPortStateChange(this);
+  function isGsReset(bytes) {
+    if (bytes.length !== 11 || bytes[10] !== 0xf7) {
+      return false;
+    }
+    for (let i = 0; i < GS_RESET_PREFIX.length; i += 1) {
+      if (GS_RESET_PREFIX[i] != null && bytes[i] !== GS_RESET_PREFIX[i]) {
+        return false;
       }
     }
+    return bytes[9] === rolandChecksum(bytes.slice(5, 9));
+  }
 
-    recordDroppedQueuedEvents() {
-      if (this.queue.length) {
-        this.synth.recordDroppedMidiEvents(this.queue.length);
-      }
-    }
+  function rolandChecksum(addressAndData) {
+    const sum = addressAndData.reduce((total, value) => total + value, 0);
+    return (128 - (sum % 128)) & 0x7f;
   }
 
   class LookaheadScheduler {
@@ -1016,6 +648,1127 @@ var WebMidiAudioShim = (function (exports) {
 
     tick() {
       this.onTick();
+    }
+  }
+
+  class ParsedSoundFont {
+    constructor(data) {
+      this.presets = data.presets;
+      this.presetBags = data.presetBags;
+      this.presetGenerators = data.presetGenerators;
+      this.instruments = data.instruments;
+      this.instrumentBags = data.instrumentBags;
+      this.instrumentGenerators = data.instrumentGenerators;
+      this.samples = data.samples;
+      this.sampleData = data.sampleData;
+      this.regionCache = new Map();
+      this.presetMap = new Map();
+
+      for (const preset of this.presets) {
+        if (!preset.terminal) {
+          this.presetMap.set(`${preset.bank}:${preset.preset}`, preset);
+        }
+      }
+    }
+
+    getPreset(bank, program) {
+      return this.presetMap.get(`${bank}:${program}`) || null;
+    }
+
+    getPresetRegions(preset) {
+      if (this.regionCache.has(preset.index)) {
+        return this.regionCache.get(preset.index);
+      }
+
+      const presetZones = this.getPresetZones(preset.index);
+      const presetGlobal = mergeZoneList(presetZones.filter((zone) => zone.instrument == null).map((zone) => zone.generators));
+      const regions = [];
+
+      for (const presetZone of presetZones) {
+        if (presetZone.instrument == null) {
+          continue;
+        }
+
+        const presetGenerators = mergeGenerators(presetGlobal, presetZone.generators);
+        const instrument = this.instruments[presetZone.instrument];
+        if (!instrument) {
+          continue;
+        }
+
+        const instrumentZones = this.getInstrumentZones(instrument.index);
+        const instrumentGlobal = mergeZoneList(instrumentZones.filter((zone) => zone.sampleID == null).map((zone) => zone.generators));
+        for (const instrumentZone of instrumentZones) {
+          if (instrumentZone.sampleID == null) {
+            continue;
+          }
+
+          const region = mergeGenerators(
+            mergeGenerators(presetGenerators, instrumentGlobal),
+            instrumentZone.generators
+          );
+          if (region.sampleID != null && region.sampleID >= 0 && region.sampleID < this.samples.length && validRange(region.keyRange) && validRange(region.velRange)) {
+            regions.push(region);
+          }
+        }
+      }
+
+      this.regionCache.set(preset.index, regions);
+      return regions;
+    }
+
+    getPresetZones(presetIndex) {
+      const preset = this.presets[presetIndex];
+      const nextPreset = this.presets[presetIndex + 1];
+      return buildZones(this.presetBags, this.presetGenerators, preset.presetBagIndex, nextPreset.presetBagIndex, "instrument");
+    }
+
+    getInstrumentZones(instrumentIndex) {
+      const instrument = this.instruments[instrumentIndex];
+      const nextInstrument = this.instruments[instrumentIndex + 1];
+      return buildZones(this.instrumentBags, this.instrumentGenerators, instrument.instrumentBagIndex, nextInstrument.instrumentBagIndex, "sampleID");
+    }
+  }
+
+  function parseSoundFont(arrayBuffer) {
+    const view = new DataView(arrayBuffer);
+    if (readString(view, 0, 4) !== "RIFF" || readString(view, 8, 4) !== "sfbk") {
+      throw new Error("The embedded file is not an SF2 SoundFont bank.");
+    }
+
+    const riffEnd = 8 + view.getUint32(4, true);
+    const chunks = { pdta: new Map(), sdta: new Map() };
+    let offset = 12;
+
+    while (offset < riffEnd) {
+      const id = readString(view, offset, 4);
+      const size = view.getUint32(offset + 4, true);
+      if (id === "LIST") {
+        const listType = readString(view, offset + 8, 4);
+        if (listType === "pdta" || listType === "sdta") {
+          readListChunks(view, offset + 12, offset + 8 + size, chunks[listType]);
+        }
+      }
+      offset += 8 + size + (size % 2);
+    }
+
+    const smpl = chunks.sdta.get("smpl");
+    if (!smpl) {
+      throw new Error("The SF2 file has no sample data chunk.");
+    }
+
+    const sampleBytes = arrayBuffer.slice(smpl.offset, smpl.offset + smpl.size);
+    const sampleData = new Int16Array(sampleBytes);
+    const data = {
+      presets: parsePresetHeaders(view, requiredChunk(chunks.pdta, "phdr")),
+      presetBags: parseBags(view, requiredChunk(chunks.pdta, "pbag"), "presetBagIndex"),
+      presetGenerators: parseGenerators(view, requiredChunk(chunks.pdta, "pgen")),
+      instruments: parseInstruments(view, requiredChunk(chunks.pdta, "inst")),
+      instrumentBags: parseBags(view, requiredChunk(chunks.pdta, "ibag"), "instrumentBagIndex"),
+      instrumentGenerators: parseGenerators(view, requiredChunk(chunks.pdta, "igen")),
+      samples: parseSampleHeaders(view, requiredChunk(chunks.pdta, "shdr")),
+      sampleData
+    };
+
+    return new ParsedSoundFont(data);
+  }
+
+  function readListChunks(view, start, end, target) {
+    let offset = start;
+    while (offset < end) {
+      const id = readString(view, offset, 4);
+      const size = view.getUint32(offset + 4, true);
+      target.set(id, { offset: offset + 8, size });
+      offset += 8 + size + (size % 2);
+    }
+  }
+
+  function parsePresetHeaders(view, chunk) {
+    const recordSize = 38;
+    const count = chunk.size / recordSize;
+    const presets = [];
+    for (let i = 0; i < count - 1; i += 1) {
+      const offset = chunk.offset + i * recordSize;
+      presets.push({
+        index: i,
+        name: readNullTerminatedString(view, offset, 20),
+        preset: view.getUint16(offset + 20, true),
+        bank: view.getUint16(offset + 22, true),
+        presetBagIndex: view.getUint16(offset + 24, true)
+      });
+    }
+
+    const terminalOffset = chunk.offset + (count - 1) * recordSize;
+    presets.push({
+      index: count - 1,
+      name: readNullTerminatedString(view, terminalOffset, 20),
+      preset: view.getUint16(terminalOffset + 20, true),
+      bank: view.getUint16(terminalOffset + 22, true),
+      presetBagIndex: view.getUint16(terminalOffset + 24, true),
+      terminal: true
+    });
+    return presets;
+  }
+
+  function parseInstruments(view, chunk) {
+    const recordSize = 22;
+    const count = chunk.size / recordSize;
+    const instruments = [];
+    for (let i = 0; i < count; i += 1) {
+      const offset = chunk.offset + i * recordSize;
+      instruments.push({
+        index: i,
+        name: readNullTerminatedString(view, offset, 20),
+        instrumentBagIndex: view.getUint16(offset + 20, true),
+        terminal: i === count - 1
+      });
+    }
+    return instruments;
+  }
+
+  function parseBags(view, chunk, indexName) {
+    const recordSize = 4;
+    const count = chunk.size / recordSize;
+    const bags = [];
+    for (let i = 0; i < count; i += 1) {
+      const offset = chunk.offset + i * recordSize;
+      bags.push({
+        [indexName]: i,
+        generatorIndex: view.getUint16(offset, true),
+        modulatorIndex: view.getUint16(offset + 2, true)
+      });
+    }
+    return bags;
+  }
+
+  function parseGenerators(view, chunk) {
+    const recordSize = 4;
+    const count = chunk.size / recordSize;
+    const generators = [];
+    for (let i = 0; i < count; i += 1) {
+      const offset = chunk.offset + i * recordSize;
+      const operator = view.getUint16(offset, true);
+      const raw = view.getUint16(offset + 2, true);
+      generators.push({
+        operator,
+        name: OPERATOR_NAMES[operator] || `operator${operator}`,
+        value: decodeGeneratorAmount(operator, raw)
+      });
+    }
+    return generators;
+  }
+
+  function parseSampleHeaders(view, chunk) {
+    const recordSize = 46;
+    const count = chunk.size / recordSize;
+    const samples = [];
+    for (let i = 0; i < count - 1; i += 1) {
+      const offset = chunk.offset + i * recordSize;
+      samples.push({
+        index: i,
+        name: readNullTerminatedString(view, offset, 20),
+        start: view.getUint32(offset + 20, true),
+        end: view.getUint32(offset + 24, true),
+        startLoop: view.getUint32(offset + 28, true),
+        endLoop: view.getUint32(offset + 32, true),
+        sampleRate: view.getUint32(offset + 36, true),
+        originalPitch: view.getUint8(offset + 40),
+        pitchCorrection: view.getInt8(offset + 41),
+        sampleLink: view.getUint16(offset + 42, true),
+        sampleType: view.getUint16(offset + 44, true)
+      });
+    }
+    return samples;
+  }
+
+  function buildZones(bags, generators, startBagIndex, endBagIndex, terminalName) {
+    const zones = [];
+    for (let bagIndex = startBagIndex; bagIndex < endBagIndex; bagIndex += 1) {
+      const bag = bags[bagIndex];
+      const nextBag = bags[bagIndex + 1];
+      const zoneGenerators = {};
+      for (let genIndex = bag.generatorIndex; genIndex < nextBag.generatorIndex; genIndex += 1) {
+        const generator = generators[genIndex];
+        if (!generator || generator.operator === 60) {
+          continue;
+        }
+        applyGenerator(zoneGenerators, generator);
+      }
+
+      zones.push({
+        generators: zoneGenerators,
+        [terminalName]: zoneGenerators[terminalName]
+      });
+    }
+    return zones;
+  }
+
+  function applyGenerator(target, generator) {
+    const name = generator.name;
+    if (name === "keyRange" || name === "velRange") {
+      target[name] = generator.value;
+      return;
+    }
+
+    if (UINT16_REPLACE_OPERATORS.has(generator.operator)) {
+      target[name] = generator.value;
+      return;
+    }
+
+    if (ADDITIVE_OPERATORS.has(generator.operator)) {
+      target[name] = (target[name] || 0) + generator.value;
+      return;
+    }
+
+    target[name] = generator.value;
+  }
+
+  function mergeZoneList(zones) {
+    return zones.reduce((merged, zone) => mergeGenerators(merged, zone), {});
+  }
+
+  function mergeGenerators(base, next) {
+    const result = { ...base };
+    if (base.keyRange) {
+      result.keyRange = [...base.keyRange];
+    }
+    if (base.velRange) {
+      result.velRange = [...base.velRange];
+    }
+
+    for (const [name, value] of Object.entries(next)) {
+      if (name === "keyRange" || name === "velRange") {
+        result[name] = intersectRanges(result[name] || [0, 127], value);
+      } else if (name === "instrument" || name === "sampleID" || name === "keynum" || name === "velocity" || name === "sampleModes" || name === "exclusiveClass" || name === "overridingRootKey" || name === "scaleTuning") {
+        result[name] = value;
+      } else {
+        result[name] = (result[name] || 0) + value;
+      }
+    }
+
+    return result;
+  }
+
+  function decodeGeneratorAmount(operator, raw) {
+    if (operator === 43 || operator === 44) {
+      return [raw & 0xff, (raw >> 8) & 0xff];
+    }
+
+    if (UINT16_REPLACE_OPERATORS.has(operator)) {
+      return raw;
+    }
+
+    return raw & 0x8000 ? raw - 0x10000 : raw;
+  }
+
+  async function downloadSoundFont$1(url, progress) {
+    const fetchFn = typeof fetch === "function" ? fetch : pageGlobalThis()?.fetch?.bind(pageGlobalThis());
+    if (typeof fetchFn !== "function") {
+      throw new Error("fetch() is required to download the SoundFont.");
+    }
+
+    progress.show();
+    const response = await fetchFn(url, { cache: "no-store" });
+    if (!response.ok && response.status !== 0) {
+      throw new Error(`Failed to download SoundFont: HTTP ${response.status}`);
+    }
+
+    const total = Number(response.headers?.get?.("content-length")) || 0;
+    if (!response.body || typeof response.body.getReader !== "function") {
+      const arrayBuffer = await response.arrayBuffer();
+      progress.update(arrayBuffer.byteLength, total || arrayBuffer.byteLength);
+      return arrayBuffer;
+    }
+
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+    while (true) {
+      const result = await reader.read();
+      if (result.done) {
+        break;
+      }
+      chunks.push(result.value);
+      received += result.value.byteLength;
+      progress.update(received, total);
+    }
+
+    progress.update(received, total || received);
+    return concatenateUint8Arrays(chunks, received).buffer;
+  }
+
+  function concatenateUint8Arrays(chunks, byteLength) {
+    const combined = new Uint8Array(byteLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      combined.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return combined;
+  }
+
+  async function readCachedSoundFont(key) {
+    const db = await openSoundFontCache();
+    if (!db) {
+      return null;
+    }
+    try {
+      const record = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).get(key));
+      return isArrayBuffer(record?.data) ? record.data : null;
+    } catch {
+      return null;
+    } finally {
+      db.close?.();
+    }
+  }
+
+  async function loadInstalledSoundFontRecords() {
+    const db = await openSoundFontCache();
+    if (!db) {
+      return [];
+    }
+    try {
+      const records = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).getAll());
+      return records.filter((record) => record?.custom && isArrayBuffer(record.data));
+    } catch {
+      return [];
+    } finally {
+      db.close?.();
+    }
+  }
+
+  async function readSoundFontSettings() {
+    const db = await openSoundFontCache();
+    if (!db) {
+      return {};
+    }
+    try {
+      const record = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).get(SOUNDFONT_SETTINGS_KEY));
+      return record?.settings || {};
+    } catch {
+      return {};
+    } finally {
+      db.close?.();
+    }
+  }
+
+  async function writeSoundFontSettings(settings) {
+    const db = await openSoundFontCache();
+    if (!db) {
+      return;
+    }
+    try {
+      const existing = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).get(SOUNDFONT_SETTINGS_KEY));
+      await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readwrite").objectStore(SOUNDFONT_CACHE_STORE).put({
+        key: SOUNDFONT_SETTINGS_KEY,
+        settings: {
+          ...(existing?.settings || {}),
+          ...settings
+        },
+        updatedAt: Date.now()
+      }));
+    } catch {
+      // User settings are a convenience; MIDI output still works without them.
+    } finally {
+      db.close?.();
+    }
+  }
+
+  async function writeCachedSoundFont(key, arrayBuffer, metadata = {}) {
+    const db = await openSoundFontCache();
+    if (!db) {
+      return;
+    }
+    try {
+      await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readwrite").objectStore(SOUNDFONT_CACHE_STORE).put({
+        key,
+        data: arrayBuffer,
+        byteLength: arrayBuffer.byteLength,
+        name: metadata.name || key,
+        custom: !!metadata.custom,
+        source: metadata.source || "",
+        url: metadata.url || "",
+        updatedAt: Date.now()
+      }));
+    } catch {
+      // Playback still works without a persistent cache.
+    } finally {
+      db.close?.();
+    }
+  }
+
+  async function updateCachedSoundFontMetadata(key, metadata = {}) {
+    const db = await openSoundFontCache();
+    if (!db) {
+      return;
+    }
+    try {
+      const record = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).get(key));
+      if (!record) {
+        return;
+      }
+      await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readwrite").objectStore(SOUNDFONT_CACHE_STORE).put({
+        ...record,
+        ...metadata,
+        key,
+        updatedAt: Date.now()
+      }));
+    } catch {
+      // Runtime device names remain usable even if metadata persistence fails.
+    } finally {
+      db.close?.();
+    }
+  }
+
+  async function deleteCachedSoundFont(key) {
+    const db = await openSoundFontCache();
+    if (!db) {
+      return;
+    }
+    try {
+      await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readwrite").objectStore(SOUNDFONT_CACHE_STORE).delete(key));
+    } catch {
+      // Nothing useful to report for cache cleanup failures.
+    } finally {
+      db.close?.();
+    }
+  }
+
+  function openSoundFontCache() {
+    if (typeof indexedDB === "undefined" || !indexedDB?.open) {
+      return Promise.resolve(null);
+    }
+
+    return new Promise((resolve) => {
+      const request = indexedDB.open(SOUNDFONT_CACHE_DB, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(SOUNDFONT_CACHE_STORE)) {
+          db.createObjectStore(SOUNDFONT_CACHE_STORE, { keyPath: "key" });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => resolve(null);
+      request.onblocked = () => resolve(null);
+    });
+  }
+
+  function idbRequestToPromise(request) {
+    return new Promise((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error("IndexedDB request failed."));
+    });
+  }
+
+  function isArrayBuffer(value) {
+    return Object.prototype.toString.call(value) === "[object ArrayBuffer]";
+  }
+
+  function createSoundFontProgressOverlay$1() {
+    if (typeof document === "undefined" || typeof document.createElement !== "function") {
+      return noopProgress();
+    }
+
+    let host = null;
+    let label = null;
+    let detail = null;
+    let fill = null;
+    let hideTimer = null;
+
+    function ensure() {
+      if (host) {
+        return;
+      }
+
+      host = document.createElement("div");
+      host.style.cssText = [
+        "position:fixed",
+        "left:50%",
+        "bottom:18px",
+        "transform:translateX(-50%)",
+        "z-index:2147483647",
+        "width:min(420px,calc(100vw - 32px))",
+        "box-sizing:border-box",
+        "padding:12px 14px",
+        "border-radius:8px",
+        "background:rgba(18,18,22,0.94)",
+        "color:#fff",
+        "font:13px/1.35 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+        "box-shadow:0 10px 30px rgba(0,0,0,0.28)",
+        "pointer-events:none"
+      ].join(";");
+
+      label = document.createElement("div");
+      label.textContent = "Downloading SoundFont";
+      label.style.cssText = "font-weight:600;margin-bottom:6px";
+
+      const track = document.createElement("div");
+      track.style.cssText = "height:6px;border-radius:999px;background:rgba(255,255,255,0.18);overflow:hidden";
+
+      fill = document.createElement("div");
+      fill.style.cssText = "height:100%;width:0%;border-radius:999px;background:#7dd3fc;transition:width 120ms linear";
+      track.appendChild(fill);
+
+      detail = document.createElement("div");
+      detail.textContent = "Starting download";
+      detail.style.cssText = "margin-top:6px;color:rgba(255,255,255,0.78);font-size:12px";
+
+      host.appendChild(label);
+      host.appendChild(track);
+      host.appendChild(detail);
+    }
+
+    function attach() {
+      ensure();
+      if (hideTimer) {
+        clearTimeout(hideTimer);
+        hideTimer = null;
+      }
+      if (!host.isConnected) {
+        (document.body || document.documentElement).appendChild(host);
+      }
+    }
+
+    function detach(delay = 700) {
+      hideTimer = setTimeout(() => {
+        host?.remove();
+      }, delay);
+    }
+
+    return {
+      show() {
+        attach();
+        label.textContent = "Downloading SoundFont";
+        detail.textContent = "Starting download";
+        fill.style.width = "0%";
+        fill.style.background = "#7dd3fc";
+      },
+      update(loaded, total) {
+        attach();
+        if (total > 0) {
+          const percent = clamp((loaded / total) * 100, 0, 100);
+          fill.style.width = `${percent.toFixed(1)}%`;
+          detail.textContent = `${formatBytes(loaded)} / ${formatBytes(total)} (${Math.round(percent)}%)`;
+        } else {
+          fill.style.width = "100%";
+          detail.textContent = `${formatBytes(loaded)} downloaded`;
+        }
+      },
+      finish() {
+        attach();
+        label.textContent = "SoundFont ready";
+        detail.textContent = "Cached for future loads";
+        fill.style.width = "100%";
+        fill.style.background = "#86efac";
+        detach();
+      },
+      fail(error) {
+        attach();
+        label.textContent = "SoundFont download failed";
+        detail.textContent = error?.message || "Unknown error";
+        fill.style.background = "#fb7185";
+      }
+    };
+  }
+
+  function noopProgress() {
+    return {
+      show() {},
+      update() {},
+      finish() {},
+      fail() {}
+    };
+  }
+
+  function openSoundFontSettingsPanel(shim) {
+    if (typeof document === "undefined" || typeof document.createElement !== "function") {
+      return;
+    }
+
+    const existing = document.getElementById("web-midi-sf2-settings");
+    if (existing) {
+      existing.__webMidiSf2Cleanup?.();
+      existing.remove();
+    }
+
+    const host = document.createElement("div");
+    host.id = "web-midi-sf2-settings";
+    host.style.cssText = [
+      "position:fixed",
+      "inset:0",
+      "z-index:2147483646",
+      "background:rgba(0,0,0,0.42)",
+      "display:flex",
+      "align-items:center",
+      "justify-content:center",
+      "padding:18px",
+      "box-sizing:border-box",
+      "font:14px/1.4 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+      "color:#111"
+    ].join(";");
+
+    const panel = document.createElement("div");
+    panel.style.cssText = [
+      "width:min(680px,100%)",
+      "max-height:min(760px,calc(100vh - 36px))",
+      "overflow:auto",
+      "box-sizing:border-box",
+      "border-radius:8px",
+      "background:#fff",
+      "box-shadow:0 20px 60px rgba(0,0,0,0.34)",
+      "padding:18px"
+    ].join(";");
+
+    const titleRow = document.createElement("div");
+    titleRow.style.cssText = "display:flex;align-items:center;gap:12px;margin-bottom:14px";
+    const title = document.createElement("div");
+    title.textContent = "SF2 MIDI devices";
+    title.style.cssText = "font-size:18px;font-weight:700;flex:1";
+    const closeButton = document.createElement("button");
+    closeButton.type = "button";
+    closeButton.textContent = "Close";
+    closeButton.style.cssText = buttonStyle();
+    titleRow.append(title, closeButton);
+
+    let statsTimer = null;
+
+    function closePanel() {
+      if (statsTimer != null) {
+        clearInterval(statsTimer);
+        statsTimer = null;
+      }
+      host.__webMidiSf2Cleanup = null;
+      host.remove();
+    }
+
+    host.__webMidiSf2Cleanup = closePanel;
+    closeButton.addEventListener("click", closePanel);
+
+    const gainRow = document.createElement("label");
+    gainRow.style.cssText = [
+      "display:grid",
+      "grid-template-columns:auto minmax(160px,1fr) 48px",
+      "gap:10px",
+      "align-items:center",
+      "margin-bottom:14px",
+      "font-size:13px"
+    ].join(";");
+    const gainLabel = document.createElement("span");
+    gainLabel.textContent = "Output gain";
+    const gainInput = document.createElement("input");
+    gainInput.type = "range";
+    gainInput.min = "0";
+    gainInput.max = "1";
+    gainInput.step = "0.01";
+    gainInput.value = String(shim.getMasterGain());
+    const gainValue = document.createElement("span");
+    gainValue.style.cssText = "text-align:right;color:#475569;font-variant-numeric:tabular-nums";
+
+    function refreshGainValue() {
+      gainValue.textContent = `${Math.round(shim.getMasterGain() * 100)}%`;
+    }
+
+    gainInput.addEventListener("input", () => {
+      const nextGain = shim.setMasterGain(Number(gainInput.value));
+      gainInput.value = String(nextGain);
+      refreshGainValue();
+    });
+    refreshGainValue();
+    gainRow.append(gainLabel, gainInput, gainValue);
+
+    const passthroughRow = document.createElement("label");
+    passthroughRow.style.cssText = [
+      "display:flex",
+      "align-items:center",
+      "gap:8px",
+      "margin-bottom:14px",
+      "font-size:13px",
+      "cursor:pointer"
+    ].join(";");
+    const passthroughInput = document.createElement("input");
+    passthroughInput.type = "checkbox";
+    passthroughInput.checked = shim.getPassthroughRealMidi();
+    const passthroughLabel = document.createElement("span");
+    passthroughLabel.textContent = "Passthrough real MIDI devices";
+    passthroughInput.addEventListener("change", async () => {
+      passthroughInput.disabled = true;
+      try {
+        await shim.setPassthroughRealMidi(passthroughInput.checked);
+        setStatus(passthroughInput.checked ? "Real MIDI passthrough enabled" : "Real MIDI passthrough disabled");
+        refreshPerformanceStats();
+      } catch (error) {
+        passthroughInput.checked = shim.getPassthroughRealMidi();
+        setStatus(error?.message || "Could not update MIDI passthrough", true);
+      } finally {
+        passthroughInput.disabled = false;
+      }
+    });
+    passthroughRow.append(passthroughInput, passthroughLabel);
+
+    const voiceLimitsRow = document.createElement("div");
+    voiceLimitsRow.style.cssText = [
+      "display:grid",
+      "grid-template-columns:1fr 1fr",
+      "gap:10px",
+      "margin-bottom:14px"
+    ].join(";");
+    const maxVoicesInput = createNumberSettingInput("Max voices", shim.getVoiceLimits().maxVoices, 8, 512);
+    const maxVoicesPerChannelInput = createNumberSettingInput("Per channel", shim.getVoiceLimits().maxVoicesPerChannel, 4, 256);
+
+    async function applyVoiceLimitInputs() {
+      const limits = shim.setVoiceLimits({
+        maxVoices: maxVoicesInput.input.value,
+        maxVoicesPerChannel: maxVoicesPerChannelInput.input.value
+      });
+      maxVoicesInput.input.value = String(limits.maxVoices);
+      maxVoicesPerChannelInput.input.value = String(limits.maxVoicesPerChannel);
+      setStatus("Voice limits updated");
+      refreshPerformanceStats();
+    }
+
+    maxVoicesInput.input.addEventListener("change", applyVoiceLimitInputs);
+    maxVoicesPerChannelInput.input.addEventListener("change", applyVoiceLimitInputs);
+    voiceLimitsRow.append(maxVoicesInput.label, maxVoicesPerChannelInput.label);
+
+    const performanceSection = document.createElement("div");
+    performanceSection.style.cssText = [
+      "border:1px solid #e2e8f0",
+      "border-radius:8px",
+      "padding:10px",
+      "margin-bottom:14px",
+      "background:#f8fafc"
+    ].join(";");
+    const performanceTitle = document.createElement("div");
+    performanceTitle.textContent = "MIDI performance";
+    performanceTitle.style.cssText = "font-weight:700;margin-bottom:8px";
+    const performanceRows = document.createElement("div");
+    performanceRows.style.cssText = "display:flex;flex-direction:column;gap:4px";
+    performanceSection.append(performanceTitle, performanceRows);
+
+    let lastPerformanceSnapshot = null;
+
+    function refreshPerformanceStats() {
+      const snapshot = shim.getPerformanceStats();
+      const previous = lastPerformanceSnapshot;
+      const elapsedSeconds = previous ? Math.max(0.001, (snapshot.updatedAt - previous.updatedAt) / 1000) : 1;
+      const previousById = new Map((previous?.devices || []).map((device) => [device.id, device]));
+      performanceRows.replaceChildren();
+      performanceRows.append(createPerformanceHeaderRow());
+      performanceRows.append(createPerformanceRow("Total", snapshot.totals, previous?.totals, elapsedSeconds, true));
+      for (const device of snapshot.devices) {
+        performanceRows.append(createPerformanceRow(device.name, device.stats, previousById.get(device.id)?.stats, elapsedSeconds, false));
+      }
+      lastPerformanceSnapshot = snapshot;
+    }
+
+    function createPerformanceHeaderRow() {
+      const row = document.createElement("div");
+      row.style.cssText = performanceRowStyle(true);
+      for (const text of ["Device", "Events/s", "Notes/s", "Drop evt/s", "Drop notes/s", "Voices"]) {
+        const cell = document.createElement("div");
+        cell.textContent = text;
+        cell.style.cssText = "font-size:11px;color:#64748b;font-weight:700";
+        row.append(cell);
+      }
+      return row;
+    }
+
+    function createPerformanceRow(name, stats, previousStats, elapsedSeconds, total = false) {
+      const row = document.createElement("div");
+      row.style.cssText = performanceRowStyle(false);
+      const previousForRate = previousStats || stats;
+      const nameCell = document.createElement("div");
+      nameCell.textContent = name;
+      nameCell.style.cssText = [
+        "min-width:0",
+        "overflow:hidden",
+        "text-overflow:ellipsis",
+        "white-space:nowrap",
+        total ? "font-weight:700" : "font-weight:600"
+      ].join(";");
+      row.append(
+        nameCell,
+        performanceMetricCell(formatRate(perSecond(stats.midiEvents, previousForRate.midiEvents, elapsedSeconds))),
+        performanceMetricCell(formatRate(perSecond(stats.playedNotes, previousForRate.playedNotes, elapsedSeconds))),
+        performanceMetricCell(formatRate(perSecond(stats.droppedMidiEvents, previousForRate.droppedMidiEvents, elapsedSeconds)), stats.droppedMidiEvents > previousForRate.droppedMidiEvents),
+        performanceMetricCell(formatRate(perSecond(stats.droppedNotes, previousForRate.droppedNotes, elapsedSeconds)), stats.droppedNotes > previousForRate.droppedNotes),
+        performanceMetricCell(String(stats.activeVoices || 0))
+      );
+      return row;
+    }
+
+    function performanceMetricCell(text, warning = false) {
+      const cell = document.createElement("div");
+      cell.textContent = text;
+      cell.style.cssText = [
+        "font-variant-numeric:tabular-nums",
+        "text-align:right",
+        warning ? "color:#be123c;font-weight:700" : "color:#0f172a"
+      ].join(";");
+      return cell;
+    }
+
+    refreshPerformanceStats();
+    statsTimer = setInterval(refreshPerformanceStats, 1000);
+
+    const dropZone = document.createElement("div");
+    dropZone.style.cssText = [
+      "border:1px dashed #8aa0b8",
+      "border-radius:8px",
+      "padding:18px",
+      "background:#f8fafc",
+      "text-align:center",
+      "margin-bottom:12px"
+    ].join(";");
+    dropZone.textContent = "Drop an .sf2 file here";
+
+    const fileInput = document.createElement("input");
+    fileInput.type = "file";
+    fileInput.accept = ".sf2,.sf3,audio/x-soundfont";
+    fileInput.style.display = "none";
+
+    const selectFileButton = document.createElement("button");
+    selectFileButton.type = "button";
+    selectFileButton.textContent = "Install SF2 file";
+    selectFileButton.style.cssText = buttonStyle("primary");
+    selectFileButton.addEventListener("click", () => fileInput.click());
+
+    const urlRow = document.createElement("div");
+    urlRow.style.cssText = "display:flex;gap:8px;margin:12px 0 16px;align-items:center";
+    const urlInput = document.createElement("input");
+    urlInput.type = "url";
+    urlInput.placeholder = "Paste SF2 URL";
+    urlInput.style.cssText = [
+      "flex:1",
+      "box-sizing:border-box",
+      "border:1px solid #cbd5e1",
+      "border-radius:6px",
+      "padding:8px 10px",
+      "font:inherit"
+    ].join(";");
+    const installUrlButton = document.createElement("button");
+    installUrlButton.type = "button";
+    installUrlButton.textContent = "Install URL";
+    installUrlButton.style.cssText = buttonStyle();
+    urlRow.append(urlInput, installUrlButton);
+
+    const status = document.createElement("div");
+    status.style.cssText = "min-height:20px;color:#475569;margin-bottom:10px";
+
+    const devicesTitle = document.createElement("div");
+    devicesTitle.textContent = "Installed MIDI devices";
+    devicesTitle.style.cssText = "font-weight:700;margin:12px 0 8px";
+
+    const deviceList = document.createElement("div");
+    deviceList.style.cssText = "display:flex;flex-direction:column;gap:8px";
+
+    async function installFile(file) {
+      if (!file) {
+        return;
+      }
+      setStatus(`Installing ${file.name}...`);
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        await shim.installSoundFontFromArrayBuffer(arrayBuffer, {
+          fileName: file.name,
+          name: file.name,
+          source: "file"
+        });
+        setStatus(`Installed ${file.name}`);
+        refreshDevices();
+        refreshPerformanceStats();
+      } catch (error) {
+        setStatus(error?.message || "Install failed", true);
+      }
+    }
+
+    function setStatus(message, error = false) {
+      status.textContent = message;
+      status.style.color = error ? "#be123c" : "#475569";
+    }
+
+    function refreshDevices() {
+      deviceList.replaceChildren();
+      const devices = shim.listSoundFontDevices();
+      for (const device of devices) {
+        const row = document.createElement("div");
+        row.style.cssText = [
+          "display:grid",
+          "grid-template-columns:minmax(0,1fr) auto auto",
+          "gap:8px",
+          "align-items:center",
+          "border:1px solid #e2e8f0",
+          "border-radius:8px",
+          "padding:10px"
+        ].join(";");
+
+        const info = document.createElement("div");
+        info.style.cssText = "min-width:0";
+        const name = document.createElement("div");
+        name.textContent = device.name;
+        name.style.cssText = "font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+        const meta = document.createElement("div");
+        meta.textContent = device.builtIn ? "Built-in device" : `Custom device: ${device.id}`;
+        meta.style.cssText = "font-size:12px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+        info.append(name, meta);
+
+        const renameButton = document.createElement("button");
+        renameButton.type = "button";
+        renameButton.textContent = "Rename";
+        renameButton.disabled = device.builtIn;
+        renameButton.style.cssText = buttonStyle();
+        renameButton.addEventListener("click", async () => {
+          const nextName = prompt("Device name", device.name);
+          if (!nextName) {
+            return;
+          }
+          await shim.renameSoundFontDevice(device.id, nextName);
+          setStatus("Renamed device");
+          refreshDevices();
+          refreshPerformanceStats();
+        });
+
+        const removeButton = document.createElement("button");
+        removeButton.type = "button";
+        removeButton.textContent = "Uninstall";
+        removeButton.disabled = device.builtIn;
+        removeButton.style.cssText = buttonStyle("danger");
+        removeButton.addEventListener("click", async () => {
+          if (!confirm(`Uninstall ${device.name}?`)) {
+            return;
+          }
+          await shim.uninstallSoundFont(device.id);
+          setStatus("Uninstalled device");
+          refreshDevices();
+          refreshPerformanceStats();
+        });
+
+        row.append(info, renameButton, removeButton);
+        deviceList.append(row);
+      }
+    }
+
+    dropZone.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      dropZone.style.background = "#e0f2fe";
+    });
+    dropZone.addEventListener("dragleave", () => {
+      dropZone.style.background = "#f8fafc";
+    });
+    dropZone.addEventListener("drop", (event) => {
+      event.preventDefault();
+      dropZone.style.background = "#f8fafc";
+      installFile(event.dataTransfer?.files?.[0]);
+    });
+    fileInput.addEventListener("change", () => installFile(fileInput.files?.[0]));
+    installUrlButton.addEventListener("click", async () => {
+      const url = urlInput.value.trim();
+      if (!url) {
+        setStatus("Paste an SF2 URL first.", true);
+        return;
+      }
+      setStatus("Downloading SF2...");
+      try {
+        await shim.installSoundFontFromUrl(url);
+        setStatus("Installed URL SF2");
+        urlInput.value = "";
+        refreshDevices();
+        refreshPerformanceStats();
+      } catch (error) {
+        setStatus(error?.message || "Install failed", true);
+      }
+    });
+    host.addEventListener("click", (event) => {
+      if (event.target === host) {
+        closePanel();
+      }
+    });
+
+    panel.append(titleRow, gainRow, passthroughRow, voiceLimitsRow, performanceSection, dropZone, selectFileButton, fileInput, urlRow, status, devicesTitle, deviceList);
+    host.append(panel);
+    document.documentElement.appendChild(host);
+    refreshDevices();
+  }
+
+  function createNumberSettingInput(text, value, min, max) {
+    const label = document.createElement("label");
+    label.style.cssText = "display:flex;flex-direction:column;gap:4px;font-size:12px;color:#475569";
+    const title = document.createElement("span");
+    title.textContent = text;
+    const input = document.createElement("input");
+    input.type = "number";
+    input.min = String(min);
+    input.max = String(max);
+    input.step = "1";
+    input.value = String(value);
+    input.style.cssText = [
+      "box-sizing:border-box",
+      "width:100%",
+      "border:1px solid #cbd5e1",
+      "border-radius:6px",
+      "padding:7px 9px",
+      "font:inherit"
+    ].join(";");
+    label.append(title, input);
+    return { label, input };
+  }
+
+  function buttonStyle(variant = "normal") {
+    const background = variant === "primary" ? "#0f172a" : variant === "danger" ? "#fff1f2" : "#fff";
+    const color = variant === "primary" ? "#fff" : variant === "danger" ? "#be123c" : "#0f172a";
+    const border = variant === "primary" ? "#0f172a" : variant === "danger" ? "#fecdd3" : "#cbd5e1";
+    return [
+      "box-sizing:border-box",
+      `background:${background}`,
+      `color:${color}`,
+      `border:1px solid ${border}`,
+      "border-radius:6px",
+      "padding:7px 10px",
+      "font:inherit",
+      "cursor:pointer"
+    ].join(";");
+  }
+
+  function performanceRowStyle(header = false) {
+    return [
+      "display:grid",
+      "grid-template-columns:minmax(92px,1.4fr) repeat(5,minmax(54px,auto))",
+      "gap:8px",
+      "align-items:center",
+      "font-size:12px",
+      header ? "padding-bottom:2px" : "padding:3px 0"
+    ].join(";");
+  }
+
+  function perSecond(current = 0, previous = 0, elapsedSeconds = 1) {
+    return Math.max(0, (current - previous) / Math.max(0.001, elapsedSeconds));
+  }
+
+  function formatRate(value) {
+    if (value >= 100) {
+      return String(Math.round(value));
+    }
+    if (value >= 10) {
+      return value.toFixed(1);
+    }
+    return value.toFixed(2);
+  }
+
+  function formatBytes(bytes) {
+    if (bytes < 1024) {
+      return `${bytes} B`;
+    }
+    if (bytes < 1024 * 1024) {
+      return `${(bytes / 1024).toFixed(1)} KB`;
+    }
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function registerSettingsMenu(shim) {
+    const register = typeof GM_registerMenuCommand === "function"
+      ? GM_registerMenuCommand
+      : globalThis.GM_registerMenuCommand;
+    if (typeof register === "function") {
+      register("SF2 Settings", () => shim.openSettings());
     }
   }
 
@@ -1879,11 +2632,11 @@ var WebMidiAudioShim = (function (exports) {
         throw new Error("No cached SoundFont data is available for this MIDI output.");
       }
 
-      const progress = this.progress || createSoundFontProgressOverlay();
+      const progress = this.progress || createSoundFontProgressOverlay$1();
       this.progress = progress;
       let arrayBuffer;
       try {
-        arrayBuffer = await downloadSoundFont(url, progress);
+        arrayBuffer = await downloadSoundFont$1(url, progress);
         if (this.cacheSoundFont) {
           await writeCachedSoundFont(this.soundFontCacheKey, arrayBuffer, { url });
         }
@@ -1919,315 +2672,6 @@ var WebMidiAudioShim = (function (exports) {
       this.pendingMidi.length = 0;
       this.sampleBufferCache.clear();
     }
-  }
-
-  class ParsedSoundFont {
-    constructor(data) {
-      this.presets = data.presets;
-      this.presetBags = data.presetBags;
-      this.presetGenerators = data.presetGenerators;
-      this.instruments = data.instruments;
-      this.instrumentBags = data.instrumentBags;
-      this.instrumentGenerators = data.instrumentGenerators;
-      this.samples = data.samples;
-      this.sampleData = data.sampleData;
-      this.regionCache = new Map();
-      this.presetMap = new Map();
-
-      for (const preset of this.presets) {
-        if (!preset.terminal) {
-          this.presetMap.set(`${preset.bank}:${preset.preset}`, preset);
-        }
-      }
-    }
-
-    getPreset(bank, program) {
-      return this.presetMap.get(`${bank}:${program}`) || null;
-    }
-
-    getPresetRegions(preset) {
-      if (this.regionCache.has(preset.index)) {
-        return this.regionCache.get(preset.index);
-      }
-
-      const presetZones = this.getPresetZones(preset.index);
-      const presetGlobal = mergeZoneList(presetZones.filter((zone) => zone.instrument == null).map((zone) => zone.generators));
-      const regions = [];
-
-      for (const presetZone of presetZones) {
-        if (presetZone.instrument == null) {
-          continue;
-        }
-
-        const presetGenerators = mergeGenerators(presetGlobal, presetZone.generators);
-        const instrument = this.instruments[presetZone.instrument];
-        if (!instrument) {
-          continue;
-        }
-
-        const instrumentZones = this.getInstrumentZones(instrument.index);
-        const instrumentGlobal = mergeZoneList(instrumentZones.filter((zone) => zone.sampleID == null).map((zone) => zone.generators));
-        for (const instrumentZone of instrumentZones) {
-          if (instrumentZone.sampleID == null) {
-            continue;
-          }
-
-          const region = mergeGenerators(
-            mergeGenerators(presetGenerators, instrumentGlobal),
-            instrumentZone.generators
-          );
-          if (region.sampleID != null && region.sampleID >= 0 && region.sampleID < this.samples.length && validRange(region.keyRange) && validRange(region.velRange)) {
-            regions.push(region);
-          }
-        }
-      }
-
-      this.regionCache.set(preset.index, regions);
-      return regions;
-    }
-
-    getPresetZones(presetIndex) {
-      const preset = this.presets[presetIndex];
-      const nextPreset = this.presets[presetIndex + 1];
-      return buildZones(this.presetBags, this.presetGenerators, preset.presetBagIndex, nextPreset.presetBagIndex, "instrument");
-    }
-
-    getInstrumentZones(instrumentIndex) {
-      const instrument = this.instruments[instrumentIndex];
-      const nextInstrument = this.instruments[instrumentIndex + 1];
-      return buildZones(this.instrumentBags, this.instrumentGenerators, instrument.instrumentBagIndex, nextInstrument.instrumentBagIndex, "sampleID");
-    }
-  }
-
-  function parseSoundFont(arrayBuffer) {
-    const view = new DataView(arrayBuffer);
-    if (readString(view, 0, 4) !== "RIFF" || readString(view, 8, 4) !== "sfbk") {
-      throw new Error("The embedded file is not an SF2 SoundFont bank.");
-    }
-
-    const riffEnd = 8 + view.getUint32(4, true);
-    const chunks = { pdta: new Map(), sdta: new Map() };
-    let offset = 12;
-
-    while (offset < riffEnd) {
-      const id = readString(view, offset, 4);
-      const size = view.getUint32(offset + 4, true);
-      if (id === "LIST") {
-        const listType = readString(view, offset + 8, 4);
-        if (listType === "pdta" || listType === "sdta") {
-          readListChunks(view, offset + 12, offset + 8 + size, chunks[listType]);
-        }
-      }
-      offset += 8 + size + (size % 2);
-    }
-
-    const smpl = chunks.sdta.get("smpl");
-    if (!smpl) {
-      throw new Error("The SF2 file has no sample data chunk.");
-    }
-
-    const sampleBytes = arrayBuffer.slice(smpl.offset, smpl.offset + smpl.size);
-    const sampleData = new Int16Array(sampleBytes);
-    const data = {
-      presets: parsePresetHeaders(view, requiredChunk(chunks.pdta, "phdr")),
-      presetBags: parseBags(view, requiredChunk(chunks.pdta, "pbag"), "presetBagIndex"),
-      presetGenerators: parseGenerators(view, requiredChunk(chunks.pdta, "pgen")),
-      instruments: parseInstruments(view, requiredChunk(chunks.pdta, "inst")),
-      instrumentBags: parseBags(view, requiredChunk(chunks.pdta, "ibag"), "instrumentBagIndex"),
-      instrumentGenerators: parseGenerators(view, requiredChunk(chunks.pdta, "igen")),
-      samples: parseSampleHeaders(view, requiredChunk(chunks.pdta, "shdr")),
-      sampleData
-    };
-
-    return new ParsedSoundFont(data);
-  }
-
-  function readListChunks(view, start, end, target) {
-    let offset = start;
-    while (offset < end) {
-      const id = readString(view, offset, 4);
-      const size = view.getUint32(offset + 4, true);
-      target.set(id, { offset: offset + 8, size });
-      offset += 8 + size + (size % 2);
-    }
-  }
-
-  function parsePresetHeaders(view, chunk) {
-    const recordSize = 38;
-    const count = chunk.size / recordSize;
-    const presets = [];
-    for (let i = 0; i < count - 1; i += 1) {
-      const offset = chunk.offset + i * recordSize;
-      presets.push({
-        index: i,
-        name: readNullTerminatedString(view, offset, 20),
-        preset: view.getUint16(offset + 20, true),
-        bank: view.getUint16(offset + 22, true),
-        presetBagIndex: view.getUint16(offset + 24, true)
-      });
-    }
-
-    const terminalOffset = chunk.offset + (count - 1) * recordSize;
-    presets.push({
-      index: count - 1,
-      name: readNullTerminatedString(view, terminalOffset, 20),
-      preset: view.getUint16(terminalOffset + 20, true),
-      bank: view.getUint16(terminalOffset + 22, true),
-      presetBagIndex: view.getUint16(terminalOffset + 24, true),
-      terminal: true
-    });
-    return presets;
-  }
-
-  function parseInstruments(view, chunk) {
-    const recordSize = 22;
-    const count = chunk.size / recordSize;
-    const instruments = [];
-    for (let i = 0; i < count; i += 1) {
-      const offset = chunk.offset + i * recordSize;
-      instruments.push({
-        index: i,
-        name: readNullTerminatedString(view, offset, 20),
-        instrumentBagIndex: view.getUint16(offset + 20, true),
-        terminal: i === count - 1
-      });
-    }
-    return instruments;
-  }
-
-  function parseBags(view, chunk, indexName) {
-    const recordSize = 4;
-    const count = chunk.size / recordSize;
-    const bags = [];
-    for (let i = 0; i < count; i += 1) {
-      const offset = chunk.offset + i * recordSize;
-      bags.push({
-        [indexName]: i,
-        generatorIndex: view.getUint16(offset, true),
-        modulatorIndex: view.getUint16(offset + 2, true)
-      });
-    }
-    return bags;
-  }
-
-  function parseGenerators(view, chunk) {
-    const recordSize = 4;
-    const count = chunk.size / recordSize;
-    const generators = [];
-    for (let i = 0; i < count; i += 1) {
-      const offset = chunk.offset + i * recordSize;
-      const operator = view.getUint16(offset, true);
-      const raw = view.getUint16(offset + 2, true);
-      generators.push({
-        operator,
-        name: OPERATOR_NAMES[operator] || `operator${operator}`,
-        value: decodeGeneratorAmount(operator, raw)
-      });
-    }
-    return generators;
-  }
-
-  function parseSampleHeaders(view, chunk) {
-    const recordSize = 46;
-    const count = chunk.size / recordSize;
-    const samples = [];
-    for (let i = 0; i < count - 1; i += 1) {
-      const offset = chunk.offset + i * recordSize;
-      samples.push({
-        index: i,
-        name: readNullTerminatedString(view, offset, 20),
-        start: view.getUint32(offset + 20, true),
-        end: view.getUint32(offset + 24, true),
-        startLoop: view.getUint32(offset + 28, true),
-        endLoop: view.getUint32(offset + 32, true),
-        sampleRate: view.getUint32(offset + 36, true),
-        originalPitch: view.getUint8(offset + 40),
-        pitchCorrection: view.getInt8(offset + 41),
-        sampleLink: view.getUint16(offset + 42, true),
-        sampleType: view.getUint16(offset + 44, true)
-      });
-    }
-    return samples;
-  }
-
-  function buildZones(bags, generators, startBagIndex, endBagIndex, terminalName) {
-    const zones = [];
-    for (let bagIndex = startBagIndex; bagIndex < endBagIndex; bagIndex += 1) {
-      const bag = bags[bagIndex];
-      const nextBag = bags[bagIndex + 1];
-      const zoneGenerators = {};
-      for (let genIndex = bag.generatorIndex; genIndex < nextBag.generatorIndex; genIndex += 1) {
-        const generator = generators[genIndex];
-        if (!generator || generator.operator === 60) {
-          continue;
-        }
-        applyGenerator(zoneGenerators, generator);
-      }
-
-      zones.push({
-        generators: zoneGenerators,
-        [terminalName]: zoneGenerators[terminalName]
-      });
-    }
-    return zones;
-  }
-
-  function applyGenerator(target, generator) {
-    const name = generator.name;
-    if (name === "keyRange" || name === "velRange") {
-      target[name] = generator.value;
-      return;
-    }
-
-    if (UINT16_REPLACE_OPERATORS.has(generator.operator)) {
-      target[name] = generator.value;
-      return;
-    }
-
-    if (ADDITIVE_OPERATORS.has(generator.operator)) {
-      target[name] = (target[name] || 0) + generator.value;
-      return;
-    }
-
-    target[name] = generator.value;
-  }
-
-  function mergeZoneList(zones) {
-    return zones.reduce((merged, zone) => mergeGenerators(merged, zone), {});
-  }
-
-  function mergeGenerators(base, next) {
-    const result = { ...base };
-    if (base.keyRange) {
-      result.keyRange = [...base.keyRange];
-    }
-    if (base.velRange) {
-      result.velRange = [...base.velRange];
-    }
-
-    for (const [name, value] of Object.entries(next)) {
-      if (name === "keyRange" || name === "velRange") {
-        result[name] = intersectRanges(result[name] || [0, 127], value);
-      } else if (name === "instrument" || name === "sampleID" || name === "keynum" || name === "velocity" || name === "sampleModes" || name === "exclusiveClass" || name === "overridingRootKey" || name === "scaleTuning") {
-        result[name] = value;
-      } else {
-        result[name] = (result[name] || 0) + value;
-      }
-    }
-
-    return result;
-  }
-
-  function decodeGeneratorAmount(operator, raw) {
-    if (operator === 43 || operator === 44) {
-      return [raw & 0xff, (raw >> 8) & 0xff];
-    }
-
-    if (UINT16_REPLACE_OPERATORS.has(operator)) {
-      return raw;
-    }
-
-    return raw & 0x8000 ? raw - 0x10000 : raw;
   }
 
   function resolveSampleWindow(region, sample, sampleDataLength) {
@@ -2407,39 +2851,6 @@ var WebMidiAudioShim = (function (exports) {
     channel.dataEntryLsb = 0;
   }
 
-  function scheduleOutputMessages(output, batch) {
-    if (!batch.length) {
-      return;
-    }
-    if (typeof output.scheduleMessages === "function") {
-      output.scheduleMessages(batch);
-      return;
-    }
-    for (const item of batch) {
-      output.send(item.data, item.timestamp);
-    }
-  }
-
-  function compareQueuedMidiMessage(a, b) {
-    return a.timestamp - b.timestamp || a.sequence - b.sequence;
-  }
-
-  function positiveNumberOrDefault(value, defaultValue, minimum = 0) {
-    const number = Number(value);
-    if (!Number.isFinite(number) || number <= 0) {
-      return Math.max(minimum, defaultValue);
-    }
-    return Math.max(minimum, number);
-  }
-
-  function positiveIntegerOrDefault(value, defaultValue) {
-    const number = Math.floor(Number(value));
-    if (!Number.isFinite(number) || number <= 0) {
-      return defaultValue;
-    }
-    return number;
-  }
-
   function countManagedVoices(voices) {
     let count = 0;
     for (const voice of voices) {
@@ -2487,914 +2898,49 @@ var WebMidiAudioShim = (function (exports) {
     return b.startedAt < a.startedAt ? b : a;
   }
 
-  function publicSoundFontDevice(device) {
-    if (!device) {
-      return null;
-    }
-    return {
-      id: device.id,
-      key: device.key,
-      name: device.name,
-      builtIn: !!device.builtIn,
-      source: device.source || ""
-    };
-  }
-
-  function createPerformanceStats() {
-    return {
-      midiEvents: 0,
-      playedNotes: 0,
-      droppedMidiEvents: 0,
-      droppedNotes: 0
-    };
-  }
-
-  function incrementPerformanceStat(stats, key, count = 1) {
-    const amount = Math.max(0, Math.floor(Number(count) || 0));
-    if (amount) {
-      stats[key] += amount;
-    }
-  }
-
-  function aggregatePerformanceStats(devices) {
-    const totals = {
-      ...createPerformanceStats(),
-      activeNotes: 0,
-      activeVoices: 0,
-      pendingMidi: 0,
-      sampleBuffers: 0
-    };
-    const deviceStats = devices.map((device) => {
-      const stats = device.synth.getPerformanceStats();
-      for (const key of Object.keys(totals)) {
-        totals[key] += stats[key] || 0;
-      }
-      return {
-        ...publicSoundFontDevice(device),
-        stats
-      };
-    });
-    return {
-      updatedAt: performanceNow(),
-      totals,
-      devices: deviceStats
-    };
-  }
-
-  function createCustomSoundFontKey(name) {
-    return `${CUSTOM_SOUNDFONT_PREFIX}${Date.now()}-${simpleHash(name).toString(36)}`;
-  }
-
-  function simpleHash(value) {
-    let hash = 2166136261;
-    const text = String(value || "");
-    for (let i = 0; i < text.length; i += 1) {
-      hash ^= text.charCodeAt(i);
-      hash = Math.imul(hash, 16777619);
-    }
-    return hash >>> 0;
-  }
-
-  function cleanSoundFontName(name) {
-    const text = String(name || "Custom SF2")
-      .replace(/\.(sf2|sf3)$/i, "")
-      .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-    return text || "Custom SF2";
-  }
-
-  function fileNameFromUrl(url) {
-    try {
-      const base = typeof location !== "undefined" ? location.href : "https://example.invalid/";
-      const pathname = new URL(url, base).pathname;
-      return decodeURIComponent(pathname.split("/").filter(Boolean).pop() || "");
-    } catch {
-      return String(url || "").split("/").filter(Boolean).pop() || "";
-    }
-  }
-
-  async function downloadSoundFont(url, progress) {
-    const fetchFn = typeof fetch === "function" ? fetch : pageGlobalThis()?.fetch?.bind(pageGlobalThis());
-    if (typeof fetchFn !== "function") {
-      throw new Error("fetch() is required to download the SoundFont.");
+  class SimpleEventTarget {
+    constructor() {
+      this.listeners = new Map();
     }
 
-    progress.show();
-    const response = await fetchFn(url, { cache: "no-store" });
-    if (!response.ok && response.status !== 0) {
-      throw new Error(`Failed to download SoundFont: HTTP ${response.status}`);
+    addEventListener(type, listener) {
+      const listeners = this.listeners.get(type) || new Set();
+      listeners.add(listener);
+      this.listeners.set(type, listeners);
     }
 
-    const total = Number(response.headers?.get?.("content-length")) || 0;
-    if (!response.body || typeof response.body.getReader !== "function") {
-      const arrayBuffer = await response.arrayBuffer();
-      progress.update(arrayBuffer.byteLength, total || arrayBuffer.byteLength);
-      return arrayBuffer;
-    }
-
-    const reader = response.body.getReader();
-    const chunks = [];
-    let received = 0;
-    while (true) {
-      const result = await reader.read();
-      if (result.done) {
-        break;
-      }
-      chunks.push(result.value);
-      received += result.value.byteLength;
-      progress.update(received, total);
-    }
-
-    progress.update(received, total || received);
-    return concatenateUint8Arrays(chunks, received).buffer;
-  }
-
-  function concatenateUint8Arrays(chunks, byteLength) {
-    const combined = new Uint8Array(byteLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      combined.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return combined;
-  }
-
-  async function readCachedSoundFont(key) {
-    const db = await openSoundFontCache();
-    if (!db) {
-      return null;
-    }
-    try {
-      const record = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).get(key));
-      return isArrayBuffer(record?.data) ? record.data : null;
-    } catch {
-      return null;
-    } finally {
-      db.close?.();
-    }
-  }
-
-  async function loadInstalledSoundFontRecords() {
-    const db = await openSoundFontCache();
-    if (!db) {
-      return [];
-    }
-    try {
-      const records = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).getAll());
-      return records.filter((record) => record?.custom && isArrayBuffer(record.data));
-    } catch {
-      return [];
-    } finally {
-      db.close?.();
-    }
-  }
-
-  async function readSoundFontSettings() {
-    const db = await openSoundFontCache();
-    if (!db) {
-      return {};
-    }
-    try {
-      const record = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).get(SOUNDFONT_SETTINGS_KEY));
-      return record?.settings || {};
-    } catch {
-      return {};
-    } finally {
-      db.close?.();
-    }
-  }
-
-  async function writeSoundFontSettings(settings) {
-    const db = await openSoundFontCache();
-    if (!db) {
-      return;
-    }
-    try {
-      const existing = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).get(SOUNDFONT_SETTINGS_KEY));
-      await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readwrite").objectStore(SOUNDFONT_CACHE_STORE).put({
-        key: SOUNDFONT_SETTINGS_KEY,
-        settings: {
-          ...(existing?.settings || {}),
-          ...settings
-        },
-        updatedAt: Date.now()
-      }));
-    } catch {
-      // User settings are a convenience; MIDI output still works without them.
-    } finally {
-      db.close?.();
-    }
-  }
-
-  async function writeCachedSoundFont(key, arrayBuffer, metadata = {}) {
-    const db = await openSoundFontCache();
-    if (!db) {
-      return;
-    }
-    try {
-      await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readwrite").objectStore(SOUNDFONT_CACHE_STORE).put({
-        key,
-        data: arrayBuffer,
-        byteLength: arrayBuffer.byteLength,
-        name: metadata.name || key,
-        custom: !!metadata.custom,
-        source: metadata.source || "",
-        url: metadata.url || "",
-        updatedAt: Date.now()
-      }));
-    } catch {
-      // Playback still works without a persistent cache.
-    } finally {
-      db.close?.();
-    }
-  }
-
-  async function updateCachedSoundFontMetadata(key, metadata = {}) {
-    const db = await openSoundFontCache();
-    if (!db) {
-      return;
-    }
-    try {
-      const record = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).get(key));
-      if (!record) {
-        return;
-      }
-      await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readwrite").objectStore(SOUNDFONT_CACHE_STORE).put({
-        ...record,
-        ...metadata,
-        key,
-        updatedAt: Date.now()
-      }));
-    } catch {
-      // Runtime device names remain usable even if metadata persistence fails.
-    } finally {
-      db.close?.();
-    }
-  }
-
-  async function deleteCachedSoundFont(key) {
-    const db = await openSoundFontCache();
-    if (!db) {
-      return;
-    }
-    try {
-      await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readwrite").objectStore(SOUNDFONT_CACHE_STORE).delete(key));
-    } catch {
-      // Nothing useful to report for cache cleanup failures.
-    } finally {
-      db.close?.();
-    }
-  }
-
-  function openSoundFontCache() {
-    if (typeof indexedDB === "undefined" || !indexedDB?.open) {
-      return Promise.resolve(null);
-    }
-
-    return new Promise((resolve) => {
-      const request = indexedDB.open(SOUNDFONT_CACHE_DB, 1);
-      request.onupgradeneeded = () => {
-        const db = request.result;
-        if (!db.objectStoreNames.contains(SOUNDFONT_CACHE_STORE)) {
-          db.createObjectStore(SOUNDFONT_CACHE_STORE, { keyPath: "key" });
-        }
-      };
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => resolve(null);
-      request.onblocked = () => resolve(null);
-    });
-  }
-
-  function idbRequestToPromise(request) {
-    return new Promise((resolve, reject) => {
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error || new Error("IndexedDB request failed."));
-    });
-  }
-
-  function isArrayBuffer(value) {
-    return Object.prototype.toString.call(value) === "[object ArrayBuffer]";
-  }
-
-  function createSoundFontProgressOverlay() {
-    if (typeof document === "undefined" || typeof document.createElement !== "function") {
-      return noopProgress();
-    }
-
-    let host = null;
-    let label = null;
-    let detail = null;
-    let fill = null;
-    let hideTimer = null;
-
-    function ensure() {
-      if (host) {
-        return;
-      }
-
-      host = document.createElement("div");
-      host.style.cssText = [
-        "position:fixed",
-        "left:50%",
-        "bottom:18px",
-        "transform:translateX(-50%)",
-        "z-index:2147483647",
-        "width:min(420px,calc(100vw - 32px))",
-        "box-sizing:border-box",
-        "padding:12px 14px",
-        "border-radius:8px",
-        "background:rgba(18,18,22,0.94)",
-        "color:#fff",
-        "font:13px/1.35 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
-        "box-shadow:0 10px 30px rgba(0,0,0,0.28)",
-        "pointer-events:none"
-      ].join(";");
-
-      label = document.createElement("div");
-      label.textContent = "Downloading SoundFont";
-      label.style.cssText = "font-weight:600;margin-bottom:6px";
-
-      const track = document.createElement("div");
-      track.style.cssText = "height:6px;border-radius:999px;background:rgba(255,255,255,0.18);overflow:hidden";
-
-      fill = document.createElement("div");
-      fill.style.cssText = "height:100%;width:0%;border-radius:999px;background:#7dd3fc;transition:width 120ms linear";
-      track.appendChild(fill);
-
-      detail = document.createElement("div");
-      detail.textContent = "Starting download";
-      detail.style.cssText = "margin-top:6px;color:rgba(255,255,255,0.78);font-size:12px";
-
-      host.appendChild(label);
-      host.appendChild(track);
-      host.appendChild(detail);
-    }
-
-    function attach() {
-      ensure();
-      if (hideTimer) {
-        clearTimeout(hideTimer);
-        hideTimer = null;
-      }
-      if (!host.isConnected) {
-        (document.body || document.documentElement).appendChild(host);
+    removeEventListener(type, listener) {
+      const listeners = this.listeners.get(type);
+      if (listeners) {
+        listeners.delete(listener);
       }
     }
 
-    function detach(delay = 700) {
-      hideTimer = setTimeout(() => {
-        host?.remove();
-      }, delay);
-    }
-
-    return {
-      show() {
-        attach();
-        label.textContent = "Downloading SoundFont";
-        detail.textContent = "Starting download";
-        fill.style.width = "0%";
-        fill.style.background = "#7dd3fc";
-      },
-      update(loaded, total) {
-        attach();
-        if (total > 0) {
-          const percent = clamp((loaded / total) * 100, 0, 100);
-          fill.style.width = `${percent.toFixed(1)}%`;
-          detail.textContent = `${formatBytes(loaded)} / ${formatBytes(total)} (${Math.round(percent)}%)`;
-        } else {
-          fill.style.width = "100%";
-          detail.textContent = `${formatBytes(loaded)} downloaded`;
-        }
-      },
-      finish() {
-        attach();
-        label.textContent = "SoundFont ready";
-        detail.textContent = "Cached for future loads";
-        fill.style.width = "100%";
-        fill.style.background = "#86efac";
-        detach();
-      },
-      fail(error) {
-        attach();
-        label.textContent = "SoundFont download failed";
-        detail.textContent = error?.message || "Unknown error";
-        fill.style.background = "#fb7185";
+    dispatchEvent(event) {
+      if (!event || !event.type) {
+        throw new TypeError("Event object requires a type.");
       }
-    };
-  }
-
-  function noopProgress() {
-    return {
-      show() {},
-      update() {},
-      finish() {},
-      fail() {}
-    };
-  }
-
-  function openSoundFontSettingsPanel(shim) {
-    if (typeof document === "undefined" || typeof document.createElement !== "function") {
-      return;
-    }
-
-    const existing = document.getElementById("web-midi-sf2-settings");
-    if (existing) {
-      existing.__webMidiSf2Cleanup?.();
-      existing.remove();
-    }
-
-    const host = document.createElement("div");
-    host.id = "web-midi-sf2-settings";
-    host.style.cssText = [
-      "position:fixed",
-      "inset:0",
-      "z-index:2147483646",
-      "background:rgba(0,0,0,0.42)",
-      "display:flex",
-      "align-items:center",
-      "justify-content:center",
-      "padding:18px",
-      "box-sizing:border-box",
-      "font:14px/1.4 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
-      "color:#111"
-    ].join(";");
-
-    const panel = document.createElement("div");
-    panel.style.cssText = [
-      "width:min(680px,100%)",
-      "max-height:min(760px,calc(100vh - 36px))",
-      "overflow:auto",
-      "box-sizing:border-box",
-      "border-radius:8px",
-      "background:#fff",
-      "box-shadow:0 20px 60px rgba(0,0,0,0.34)",
-      "padding:18px"
-    ].join(";");
-
-    const titleRow = document.createElement("div");
-    titleRow.style.cssText = "display:flex;align-items:center;gap:12px;margin-bottom:14px";
-    const title = document.createElement("div");
-    title.textContent = "SF2 MIDI devices";
-    title.style.cssText = "font-size:18px;font-weight:700;flex:1";
-    const closeButton = document.createElement("button");
-    closeButton.type = "button";
-    closeButton.textContent = "Close";
-    closeButton.style.cssText = buttonStyle();
-    titleRow.append(title, closeButton);
-
-    let statsTimer = null;
-
-    function closePanel() {
-      if (statsTimer != null) {
-        clearInterval(statsTimer);
-        statsTimer = null;
+      if (event.timeStamp == null) {
+        event.timeStamp = performanceNow();
       }
-      host.__webMidiSf2Cleanup = null;
-      host.remove();
-    }
-
-    host.__webMidiSf2Cleanup = closePanel;
-    closeButton.addEventListener("click", closePanel);
-
-    const gainRow = document.createElement("label");
-    gainRow.style.cssText = [
-      "display:grid",
-      "grid-template-columns:auto minmax(160px,1fr) 48px",
-      "gap:10px",
-      "align-items:center",
-      "margin-bottom:14px",
-      "font-size:13px"
-    ].join(";");
-    const gainLabel = document.createElement("span");
-    gainLabel.textContent = "Output gain";
-    const gainInput = document.createElement("input");
-    gainInput.type = "range";
-    gainInput.min = "0";
-    gainInput.max = "1";
-    gainInput.step = "0.01";
-    gainInput.value = String(shim.getMasterGain());
-    const gainValue = document.createElement("span");
-    gainValue.style.cssText = "text-align:right;color:#475569;font-variant-numeric:tabular-nums";
-
-    function refreshGainValue() {
-      gainValue.textContent = `${Math.round(shim.getMasterGain() * 100)}%`;
-    }
-
-    gainInput.addEventListener("input", () => {
-      const nextGain = shim.setMasterGain(Number(gainInput.value));
-      gainInput.value = String(nextGain);
-      refreshGainValue();
-    });
-    refreshGainValue();
-    gainRow.append(gainLabel, gainInput, gainValue);
-
-    const passthroughRow = document.createElement("label");
-    passthroughRow.style.cssText = [
-      "display:flex",
-      "align-items:center",
-      "gap:8px",
-      "margin-bottom:14px",
-      "font-size:13px",
-      "cursor:pointer"
-    ].join(";");
-    const passthroughInput = document.createElement("input");
-    passthroughInput.type = "checkbox";
-    passthroughInput.checked = shim.getPassthroughRealMidi();
-    const passthroughLabel = document.createElement("span");
-    passthroughLabel.textContent = "Passthrough real MIDI devices";
-    passthroughInput.addEventListener("change", async () => {
-      passthroughInput.disabled = true;
-      try {
-        await shim.setPassthroughRealMidi(passthroughInput.checked);
-        setStatus(passthroughInput.checked ? "Real MIDI passthrough enabled" : "Real MIDI passthrough disabled");
-        refreshPerformanceStats();
-      } catch (error) {
-        passthroughInput.checked = shim.getPassthroughRealMidi();
-        setStatus(error?.message || "Could not update MIDI passthrough", true);
-      } finally {
-        passthroughInput.disabled = false;
-      }
-    });
-    passthroughRow.append(passthroughInput, passthroughLabel);
-
-    const voiceLimitsRow = document.createElement("div");
-    voiceLimitsRow.style.cssText = [
-      "display:grid",
-      "grid-template-columns:1fr 1fr",
-      "gap:10px",
-      "margin-bottom:14px"
-    ].join(";");
-    const maxVoicesInput = createNumberSettingInput("Max voices", shim.getVoiceLimits().maxVoices, 8, 512);
-    const maxVoicesPerChannelInput = createNumberSettingInput("Per channel", shim.getVoiceLimits().maxVoicesPerChannel, 4, 256);
-
-    async function applyVoiceLimitInputs() {
-      const limits = shim.setVoiceLimits({
-        maxVoices: maxVoicesInput.input.value,
-        maxVoicesPerChannel: maxVoicesPerChannelInput.input.value
-      });
-      maxVoicesInput.input.value = String(limits.maxVoices);
-      maxVoicesPerChannelInput.input.value = String(limits.maxVoicesPerChannel);
-      setStatus("Voice limits updated");
-      refreshPerformanceStats();
-    }
-
-    maxVoicesInput.input.addEventListener("change", applyVoiceLimitInputs);
-    maxVoicesPerChannelInput.input.addEventListener("change", applyVoiceLimitInputs);
-    voiceLimitsRow.append(maxVoicesInput.label, maxVoicesPerChannelInput.label);
-
-    const performanceSection = document.createElement("div");
-    performanceSection.style.cssText = [
-      "border:1px solid #e2e8f0",
-      "border-radius:8px",
-      "padding:10px",
-      "margin-bottom:14px",
-      "background:#f8fafc"
-    ].join(";");
-    const performanceTitle = document.createElement("div");
-    performanceTitle.textContent = "MIDI performance";
-    performanceTitle.style.cssText = "font-weight:700;margin-bottom:8px";
-    const performanceRows = document.createElement("div");
-    performanceRows.style.cssText = "display:flex;flex-direction:column;gap:4px";
-    performanceSection.append(performanceTitle, performanceRows);
-
-    let lastPerformanceSnapshot = null;
-
-    function refreshPerformanceStats() {
-      const snapshot = shim.getPerformanceStats();
-      const previous = lastPerformanceSnapshot;
-      const elapsedSeconds = previous ? Math.max(0.001, (snapshot.updatedAt - previous.updatedAt) / 1000) : 1;
-      const previousById = new Map((previous?.devices || []).map((device) => [device.id, device]));
-      performanceRows.replaceChildren();
-      performanceRows.append(createPerformanceHeaderRow());
-      performanceRows.append(createPerformanceRow("Total", snapshot.totals, previous?.totals, elapsedSeconds, true));
-      for (const device of snapshot.devices) {
-        performanceRows.append(createPerformanceRow(device.name, device.stats, previousById.get(device.id)?.stats, elapsedSeconds, false));
-      }
-      lastPerformanceSnapshot = snapshot;
-    }
-
-    function createPerformanceHeaderRow() {
-      const row = document.createElement("div");
-      row.style.cssText = performanceRowStyle(true);
-      for (const text of ["Device", "Events/s", "Notes/s", "Drop evt/s", "Drop notes/s", "Voices"]) {
-        const cell = document.createElement("div");
-        cell.textContent = text;
-        cell.style.cssText = "font-size:11px;color:#64748b;font-weight:700";
-        row.append(cell);
-      }
-      return row;
-    }
-
-    function createPerformanceRow(name, stats, previousStats, elapsedSeconds, total = false) {
-      const row = document.createElement("div");
-      row.style.cssText = performanceRowStyle(false);
-      const previousForRate = previousStats || stats;
-      const nameCell = document.createElement("div");
-      nameCell.textContent = name;
-      nameCell.style.cssText = [
-        "min-width:0",
-        "overflow:hidden",
-        "text-overflow:ellipsis",
-        "white-space:nowrap",
-        total ? "font-weight:700" : "font-weight:600"
-      ].join(";");
-      row.append(
-        nameCell,
-        performanceMetricCell(formatRate(perSecond(stats.midiEvents, previousForRate.midiEvents, elapsedSeconds))),
-        performanceMetricCell(formatRate(perSecond(stats.playedNotes, previousForRate.playedNotes, elapsedSeconds))),
-        performanceMetricCell(formatRate(perSecond(stats.droppedMidiEvents, previousForRate.droppedMidiEvents, elapsedSeconds)), stats.droppedMidiEvents > previousForRate.droppedMidiEvents),
-        performanceMetricCell(formatRate(perSecond(stats.droppedNotes, previousForRate.droppedNotes, elapsedSeconds)), stats.droppedNotes > previousForRate.droppedNotes),
-        performanceMetricCell(String(stats.activeVoices || 0))
-      );
-      return row;
-    }
-
-    function performanceMetricCell(text, warning = false) {
-      const cell = document.createElement("div");
-      cell.textContent = text;
-      cell.style.cssText = [
-        "font-variant-numeric:tabular-nums",
-        "text-align:right",
-        warning ? "color:#be123c;font-weight:700" : "color:#0f172a"
-      ].join(";");
-      return cell;
-    }
-
-    refreshPerformanceStats();
-    statsTimer = setInterval(refreshPerformanceStats, 1000);
-
-    const dropZone = document.createElement("div");
-    dropZone.style.cssText = [
-      "border:1px dashed #8aa0b8",
-      "border-radius:8px",
-      "padding:18px",
-      "background:#f8fafc",
-      "text-align:center",
-      "margin-bottom:12px"
-    ].join(";");
-    dropZone.textContent = "Drop an .sf2 file here";
-
-    const fileInput = document.createElement("input");
-    fileInput.type = "file";
-    fileInput.accept = ".sf2,.sf3,audio/x-soundfont";
-    fileInput.style.display = "none";
-
-    const selectFileButton = document.createElement("button");
-    selectFileButton.type = "button";
-    selectFileButton.textContent = "Install SF2 file";
-    selectFileButton.style.cssText = buttonStyle("primary");
-    selectFileButton.addEventListener("click", () => fileInput.click());
-
-    const urlRow = document.createElement("div");
-    urlRow.style.cssText = "display:flex;gap:8px;margin:12px 0 16px;align-items:center";
-    const urlInput = document.createElement("input");
-    urlInput.type = "url";
-    urlInput.placeholder = "Paste SF2 URL";
-    urlInput.style.cssText = [
-      "flex:1",
-      "box-sizing:border-box",
-      "border:1px solid #cbd5e1",
-      "border-radius:6px",
-      "padding:8px 10px",
-      "font:inherit"
-    ].join(";");
-    const installUrlButton = document.createElement("button");
-    installUrlButton.type = "button";
-    installUrlButton.textContent = "Install URL";
-    installUrlButton.style.cssText = buttonStyle();
-    urlRow.append(urlInput, installUrlButton);
-
-    const status = document.createElement("div");
-    status.style.cssText = "min-height:20px;color:#475569;margin-bottom:10px";
-
-    const devicesTitle = document.createElement("div");
-    devicesTitle.textContent = "Installed MIDI devices";
-    devicesTitle.style.cssText = "font-weight:700;margin:12px 0 8px";
-
-    const deviceList = document.createElement("div");
-    deviceList.style.cssText = "display:flex;flex-direction:column;gap:8px";
-
-    async function installFile(file) {
-      if (!file) {
-        return;
-      }
-      setStatus(`Installing ${file.name}...`);
-      try {
-        const arrayBuffer = await file.arrayBuffer();
-        await shim.installSoundFontFromArrayBuffer(arrayBuffer, {
-          fileName: file.name,
-          name: file.name,
-          source: "file"
-        });
-        setStatus(`Installed ${file.name}`);
-        refreshDevices();
-        refreshPerformanceStats();
-      } catch (error) {
-        setStatus(error?.message || "Install failed", true);
-      }
-    }
-
-    function setStatus(message, error = false) {
-      status.textContent = message;
-      status.style.color = error ? "#be123c" : "#475569";
-    }
-
-    function refreshDevices() {
-      deviceList.replaceChildren();
-      const devices = shim.listSoundFontDevices();
-      for (const device of devices) {
-        const row = document.createElement("div");
-        row.style.cssText = [
-          "display:grid",
-          "grid-template-columns:minmax(0,1fr) auto auto",
-          "gap:8px",
-          "align-items:center",
-          "border:1px solid #e2e8f0",
-          "border-radius:8px",
-          "padding:10px"
-        ].join(";");
-
-        const info = document.createElement("div");
-        info.style.cssText = "min-width:0";
-        const name = document.createElement("div");
-        name.textContent = device.name;
-        name.style.cssText = "font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
-        const meta = document.createElement("div");
-        meta.textContent = device.builtIn ? "Built-in device" : `Custom device: ${device.id}`;
-        meta.style.cssText = "font-size:12px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
-        info.append(name, meta);
-
-        const renameButton = document.createElement("button");
-        renameButton.type = "button";
-        renameButton.textContent = "Rename";
-        renameButton.disabled = device.builtIn;
-        renameButton.style.cssText = buttonStyle();
-        renameButton.addEventListener("click", async () => {
-          const nextName = prompt("Device name", device.name);
-          if (!nextName) {
-            return;
+      event.target = this;
+      event.currentTarget = this;
+      const listeners = this.listeners.get(event.type);
+      if (listeners) {
+        for (const listener of listeners) {
+          if (typeof listener === "function") {
+            listener.call(this, event);
+          } else if (listener && typeof listener.handleEvent === "function") {
+            listener.handleEvent(event);
           }
-          await shim.renameSoundFontDevice(device.id, nextName);
-          setStatus("Renamed device");
-          refreshDevices();
-          refreshPerformanceStats();
-        });
-
-        const removeButton = document.createElement("button");
-        removeButton.type = "button";
-        removeButton.textContent = "Uninstall";
-        removeButton.disabled = device.builtIn;
-        removeButton.style.cssText = buttonStyle("danger");
-        removeButton.addEventListener("click", async () => {
-          if (!confirm(`Uninstall ${device.name}?`)) {
-            return;
-          }
-          await shim.uninstallSoundFont(device.id);
-          setStatus("Uninstalled device");
-          refreshDevices();
-          refreshPerformanceStats();
-        });
-
-        row.append(info, renameButton, removeButton);
-        deviceList.append(row);
+        }
       }
-    }
-
-    dropZone.addEventListener("dragover", (event) => {
-      event.preventDefault();
-      dropZone.style.background = "#e0f2fe";
-    });
-    dropZone.addEventListener("dragleave", () => {
-      dropZone.style.background = "#f8fafc";
-    });
-    dropZone.addEventListener("drop", (event) => {
-      event.preventDefault();
-      dropZone.style.background = "#f8fafc";
-      installFile(event.dataTransfer?.files?.[0]);
-    });
-    fileInput.addEventListener("change", () => installFile(fileInput.files?.[0]));
-    installUrlButton.addEventListener("click", async () => {
-      const url = urlInput.value.trim();
-      if (!url) {
-        setStatus("Paste an SF2 URL first.", true);
-        return;
+      const handler = this[`on${event.type}`];
+      if (typeof handler === "function") {
+        handler.call(this, event);
       }
-      setStatus("Downloading SF2...");
-      try {
-        await shim.installSoundFontFromUrl(url);
-        setStatus("Installed URL SF2");
-        urlInput.value = "";
-        refreshDevices();
-        refreshPerformanceStats();
-      } catch (error) {
-        setStatus(error?.message || "Install failed", true);
-      }
-    });
-    host.addEventListener("click", (event) => {
-      if (event.target === host) {
-        closePanel();
-      }
-    });
-
-    panel.append(titleRow, gainRow, passthroughRow, voiceLimitsRow, performanceSection, dropZone, selectFileButton, fileInput, urlRow, status, devicesTitle, deviceList);
-    host.append(panel);
-    document.documentElement.appendChild(host);
-    refreshDevices();
-  }
-
-  function createNumberSettingInput(text, value, min, max) {
-    const label = document.createElement("label");
-    label.style.cssText = "display:flex;flex-direction:column;gap:4px;font-size:12px;color:#475569";
-    const title = document.createElement("span");
-    title.textContent = text;
-    const input = document.createElement("input");
-    input.type = "number";
-    input.min = String(min);
-    input.max = String(max);
-    input.step = "1";
-    input.value = String(value);
-    input.style.cssText = [
-      "box-sizing:border-box",
-      "width:100%",
-      "border:1px solid #cbd5e1",
-      "border-radius:6px",
-      "padding:7px 9px",
-      "font:inherit"
-    ].join(";");
-    label.append(title, input);
-    return { label, input };
-  }
-
-  function buttonStyle(variant = "normal") {
-    const background = variant === "primary" ? "#0f172a" : variant === "danger" ? "#fff1f2" : "#fff";
-    const color = variant === "primary" ? "#fff" : variant === "danger" ? "#be123c" : "#0f172a";
-    const border = variant === "primary" ? "#0f172a" : variant === "danger" ? "#fecdd3" : "#cbd5e1";
-    return [
-      "box-sizing:border-box",
-      `background:${background}`,
-      `color:${color}`,
-      `border:1px solid ${border}`,
-      "border-radius:6px",
-      "padding:7px 10px",
-      "font:inherit",
-      "cursor:pointer"
-    ].join(";");
-  }
-
-  function performanceRowStyle(header = false) {
-    return [
-      "display:grid",
-      "grid-template-columns:minmax(92px,1.4fr) repeat(5,minmax(54px,auto))",
-      "gap:8px",
-      "align-items:center",
-      "font-size:12px",
-      header ? "padding-bottom:2px" : "padding:3px 0"
-    ].join(";");
-  }
-
-  function perSecond(current = 0, previous = 0, elapsedSeconds = 1) {
-    return Math.max(0, (current - previous) / Math.max(0.001, elapsedSeconds));
-  }
-
-  function formatRate(value) {
-    if (value >= 100) {
-      return String(Math.round(value));
+      return true;
     }
-    if (value >= 10) {
-      return value.toFixed(1);
-    }
-    return value.toFixed(2);
-  }
-
-  function formatBytes(bytes) {
-    if (bytes < 1024) {
-      return `${bytes} B`;
-    }
-    if (bytes < 1024 * 1024) {
-      return `${(bytes / 1024).toFixed(1)} KB`;
-    }
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  }
-
-  function registerSettingsMenu(shim) {
-    const register = typeof GM_registerMenuCommand === "function"
-      ? GM_registerMenuCommand
-      : globalThis.GM_registerMenuCommand;
-    if (typeof register === "function") {
-      register("SF2 Settings", () => shim.openSettings());
-    }
-  }
-
-  function eventSortOrder(event) {
-    if (event.tempo) {
-      return 0;
-    }
-    if (!event.data) {
-      return 1;
-    }
-    const command = event.data[0] & 0xf0;
-    return command === 0x80 || (command === 0x90 && event.data[2] === 0) ? 1 : 2;
   }
 
   function createMIDIConnectionEvent(port) {
@@ -3405,271 +2951,725 @@ var WebMidiAudioShim = (function (exports) {
     };
   }
 
-  function parseMIDIMessageSequence(data, sysexEnabled) {
-    if (data == null || typeof data[Symbol.iterator] !== "function") {
-      throw new TypeError("MIDIOutput.send() data must be an iterable sequence of bytes.");
+  class VirtualMIDIAccess extends SimpleEventTarget {
+    constructor(devices, options) {
+      super();
+      this.sysexEnabled = !!options.sysexEnabled;
+      this.inputs = new Map();
+      this.outputs = new Map();
+      this.outputOptions = options;
+      this.nativeAccess = null;
+      this.nativeInputIds = new Set();
+      this.nativeOutputIds = new Set();
+      this.nativeStateListener = null;
+
+      for (const device of devices) {
+        this.addOutputDevice(device, false);
+      }
     }
 
-    const bytes = Array.from(data, (value) => {
-      const byte = Number(value);
-      if (!Number.isInteger(byte) || byte < 0 || byte > 0xff) {
-        throw new TypeError("MIDIOutput.send() data bytes must be integers between 0x00 and 0xFF.");
+    addOutputDevice(device, notify = true) {
+      if (!device || this.outputs.has(device.id)) {
+        return;
       }
-      return byte;
-    });
-    if (!bytes.length) {
-      throw new TypeError("MIDIOutput.send() data must contain at least one MIDI message.");
+
+      const output = new VirtualMIDIOutput(device.synth, {
+        access: this,
+        id: device.id,
+        manufacturer: this.outputOptions.manufacturer || "midi-sf2-web",
+        name: device.name,
+        sysexEnabled: this.sysexEnabled,
+        lookaheadMs: this.outputOptions.lookaheadMs ?? DEFAULT_LOOKAHEAD_MS,
+        schedulerIntervalMs: this.outputOptions.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS,
+        maxMessagesPerTick: this.outputOptions.maxMessagesPerTick ?? DEFAULT_MAX_MESSAGES_PER_TICK
+      });
+      output.builtIn = !!device.builtIn;
+      output.soundFontKey = device.key;
+      this.outputs.set(output.id, output);
+      if (notify) {
+        this.emitPortStateChange(output);
+      }
     }
 
-    const messages = [];
-    let offset = 0;
-    while (offset < bytes.length) {
-      const status = bytes[offset];
-      if (status < 0x80) {
-        throw new TypeError("Running status is not allowed in MIDIOutput.send() data.");
+    attachNativeAccess(nativeAccess) {
+      if (!nativeAccess) {
+        return;
       }
-
-      if (status === 0xf0) {
-        const end = bytes.indexOf(0xf7, offset + 1);
-        if (end === -1) {
-          throw new TypeError("System Exclusive messages must terminate with 0xF7.");
+      if (this.nativeAccess && this.nativeAccess !== nativeAccess) {
+        this.detachNativeAccess();
+      }
+      this.nativeAccess = nativeAccess;
+      if (!this.nativeStateListener) {
+        this.nativeStateListener = (event) => {
+          this.syncNativePorts(true);
+          if (event?.port) {
+            this.emitPortStateChange(event.port);
+          }
+        };
+        if (typeof nativeAccess.addEventListener === "function") {
+          nativeAccess.addEventListener("statechange", this.nativeStateListener);
         }
-        if (!sysexEnabled) {
-          throw createDOMException("InvalidAccessError", "System Exclusive access was not enabled.");
+      }
+      this.syncNativePorts(true);
+    }
+
+    detachNativeAccess() {
+      if (!this.nativeAccess && !this.nativeInputIds.size && !this.nativeOutputIds.size) {
+        return;
+      }
+      if (this.nativeAccess && this.nativeStateListener && typeof this.nativeAccess.removeEventListener === "function") {
+        this.nativeAccess.removeEventListener("statechange", this.nativeStateListener);
+      }
+      for (const id of this.nativeInputIds) {
+        const port = this.inputs.get(id);
+        this.inputs.delete(id);
+        if (port) {
+          this.emitPortStateChange(port);
         }
-        messages.push(bytes.slice(offset, end + 1));
-        offset = end + 1;
-        continue;
       }
-
-      if (status === 0xf7) {
-        throw new TypeError("Unexpected System Exclusive terminator.");
-      }
-
-      if (isRealtimeStatus(status)) {
-        messages.push([status]);
-        offset += 1;
-        continue;
-      }
-
-      const length = midiMessageLength(status);
-      if (!length) {
-        offset += 1;
-        continue;
-      }
-
-      const message = [status];
-      offset += 1;
-      while (message.length < length) {
-        if (offset >= bytes.length) {
-          padMIDIMessage(message, length);
-          break;
+      for (const id of this.nativeOutputIds) {
+        const port = this.outputs.get(id);
+        this.outputs.delete(id);
+        if (port) {
+          this.emitPortStateChange(port);
         }
-        const byte = bytes[offset];
-        if (isRealtimeStatus(byte)) {
-          messages.push([byte]);
-          offset += 1;
+      }
+      this.nativeAccess = null;
+      this.nativeStateListener = null;
+      this.nativeInputIds.clear();
+      this.nativeOutputIds.clear();
+    }
+
+    syncNativePorts(notify = true) {
+      if (!this.nativeAccess) {
+        return;
+      }
+      this.syncNativePortMap("inputs", this.nativeAccess.inputs, this.nativeInputIds, notify);
+      this.syncNativePortMap("outputs", this.nativeAccess.outputs, this.nativeOutputIds, notify);
+    }
+
+    syncNativePortMap(kind, source, trackedIds, notify) {
+      const target = this[kind];
+      const seen = new Set();
+      for (const port of midiPortValues(source)) {
+        if (!port?.id) {
           continue;
         }
-        if (byte >= 0x80) {
-          padMIDIMessage(message, length);
-          break;
+        seen.add(port.id);
+        if (target.has(port.id) && !trackedIds.has(port.id)) {
+          continue;
         }
-        message.push(byte);
-        offset += 1;
+        const previous = target.get(port.id);
+        target.set(port.id, port);
+        trackedIds.add(port.id);
+        if (notify && previous !== port) {
+          this.emitPortStateChange(port);
+        }
       }
-      messages.push(message);
-    }
-
-    return messages;
-  }
-
-  function isRealtimeStatus(byte) {
-    return byte >= 0xf8 && byte <= 0xff;
-  }
-
-  function padMIDIMessage(message, length) {
-    while (message.length < length) {
-      message.push(0);
-    }
-  }
-
-  function midiMessageLength(status) {
-    if (status >= 0x80 && status <= 0xef) {
-      const command = status & 0xf0;
-      return command === 0xc0 || command === 0xd0 ? 2 : 3;
-    }
-
-    switch (status) {
-      case 0xf1:
-      case 0xf3:
-        return 2;
-      case 0xf2:
-        return 3;
-      case 0xf6:
-      case 0xf8:
-      case 0xf9:
-      case 0xfa:
-      case 0xfb:
-      case 0xfc:
-      case 0xfd:
-      case 0xfe:
-      case 0xff:
-        return 1;
-      default:
-        return 0;
-    }
-  }
-
-  function createDOMException(name, message) {
-    if (typeof DOMException === "function") {
-      return new DOMException(message, name);
-    }
-    const error = new Error(message);
-    error.name = name;
-    return error;
-  }
-
-  function matchesSysex(bytes, pattern) {
-    if (bytes.length !== pattern.length) {
-      return false;
-    }
-    for (let i = 0; i < pattern.length; i += 1) {
-      if (pattern[i] != null && bytes[i] !== pattern[i]) {
-        return false;
+      for (const id of Array.from(trackedIds)) {
+        if (seen.has(id)) {
+          continue;
+        }
+        const port = target.get(id);
+        target.delete(id);
+        trackedIds.delete(id);
+        if (notify && port) {
+          this.emitPortStateChange(port);
+        }
       }
     }
-    return true;
-  }
 
-  function isGsReset(bytes) {
-    if (bytes.length !== 11 || bytes[10] !== 0xf7) {
-      return false;
-    }
-    for (let i = 0; i < GS_RESET_PREFIX.length; i += 1) {
-      if (GS_RESET_PREFIX[i] != null && bytes[i] !== GS_RESET_PREFIX[i]) {
-        return false;
+    removeOutputDevice(deviceId) {
+      const output = this.outputs.get(deviceId);
+      if (!output) {
+        return;
       }
+      output.clear();
+      output.state = "disconnected";
+      output.connection = "closed";
+      this.outputs.delete(deviceId);
+      this.emitPortStateChange(output);
     }
-    return bytes[9] === rolandChecksum(bytes.slice(5, 9));
-  }
 
-  function rolandChecksum(addressAndData) {
-    const sum = addressAndData.reduce((total, value) => total + value, 0);
-    return (128 - (sum % 128)) & 0x7f;
-  }
-
-  function setAudioParam(param, value, when) {
-    if (typeof param.setTargetAtTime === "function") {
-      param.setTargetAtTime(value, when, 0.01);
-    } else {
-      param.setValueAtTime(value, when);
-    }
-  }
-
-  function setCompressorParam(param, value) {
-    if (param && typeof param.setValueAtTime === "function") {
-      param.setValueAtTime(value, 0);
-    }
-  }
-
-  function normalizeMasterGain(value, fallback = DEFAULT_MASTER_GAIN) {
-    const gain = Number(value);
-    return Number.isFinite(gain) ? clamp(gain, 0, 1.5) : fallback;
-  }
-
-  function normalizeVoiceLimit(value, fallback, min, max) {
-    const limit = Math.floor(Number(value));
-    return Number.isFinite(limit) ? clamp(limit, min, max) : fallback;
-  }
-
-  function requiredChunk(chunks, name) {
-    const chunk = chunks.get(name);
-    if (!chunk) {
-      throw new Error(`The SF2 file is missing the ${name} chunk.`);
-    }
-    return chunk;
-  }
-
-  function readString(view, offset, length) {
-    let result = "";
-    for (let i = 0; i < length; i += 1) {
-      result += String.fromCharCode(view.getUint8(offset + i));
-    }
-    return result;
-  }
-
-  function readNullTerminatedString(view, offset, length) {
-    return readString(view, offset, length).replace(/\0.*$/, "").trim();
-  }
-
-  function base64ToArrayBuffer(base64) {
-    if (typeof atob === "function") {
-      const binary = atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i += 1) {
-        bytes[i] = binary.charCodeAt(i);
+    renameOutputDevice(deviceId, name) {
+      const output = this.outputs.get(deviceId);
+      if (!output) {
+        return;
       }
-      return bytes.buffer;
+      output.name = name;
+      output.emitStateChange();
     }
 
-    if (typeof Buffer !== "undefined") {
-      const buffer = Buffer.from(base64, "base64");
-      return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+    emitPortStateChange(port) {
+      this.dispatchEvent(createMIDIConnectionEvent(port));
     }
-
-    throw new Error("No base64 decoder is available.");
   }
 
-  function defineRequestMIDIAccess(targetNavigator, requestMIDIAccess) {
-    try {
-      Object.defineProperty(targetNavigator, "requestMIDIAccess", {
-        value: requestMIDIAccess,
-        configurable: true,
-        writable: true
+  class VirtualMIDIOutput extends SimpleEventTarget {
+    constructor(synth, options) {
+      super();
+      this.synth = synth;
+      this.access = options.access;
+      this.id = options.id;
+      this.manufacturer = options.manufacturer;
+      this.name = options.name;
+      this.type = "output";
+      this.version = "0.1.0";
+      this.state = "connected";
+      this.connection = "closed";
+      this.sysexEnabled = !!options.sysexEnabled;
+      this.lookaheadMs = positiveNumberOrDefault(options.lookaheadMs, DEFAULT_LOOKAHEAD_MS, MIN_LOOKAHEAD_MS);
+      this.maxMessagesPerTick = positiveIntegerOrDefault(options.maxMessagesPerTick, DEFAULT_MAX_MESSAGES_PER_TICK);
+      this.queue = [];
+      this.queueSequence = 0;
+      this.scheduler = new LookaheadScheduler({
+        intervalMs: options.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS,
+        onTick: () => this.flushQueue()
       });
-    } catch {
-      targetNavigator.requestMIDIAccess = requestMIDIAccess;
+    }
+
+    open() {
+      if (this.state === "disconnected") {
+        this.connection = "pending";
+        this.emitStateChange();
+        return Promise.resolve(this);
+      }
+      if (this.connection !== "open") {
+        this.connection = "open";
+        this.emitStateChange();
+      }
+      return Promise.resolve(this);
+    }
+
+    close() {
+      if (this.connection !== "closed") {
+        this.recordDroppedQueuedEvents();
+        this.queue.length = 0;
+        this.scheduler.stop();
+        this.connection = "closed";
+        this.emitStateChange();
+      }
+      return Promise.resolve(this);
+    }
+
+    send(data, timestamp = 0) {
+      this.scheduleMessages([{ data, timestamp }]);
+    }
+
+    scheduleMessages(items) {
+      if (this.state === "disconnected") {
+        throw createDOMException("InvalidStateError", "Cannot send to a disconnected MIDI output.");
+      }
+
+      if (this.connection === "closed") {
+        this.open();
+      }
+
+      const now = performanceNow();
+      for (const item of items) {
+        let messages;
+        try {
+          messages = parseMIDIMessageSequence(item.data, this.sysexEnabled);
+        } catch (error) {
+          this.synth.recordDroppedMidiEvents(1);
+          throw error;
+        }
+        const timestampNumber = Number(item.timestamp || 0);
+        if (!Number.isFinite(timestampNumber) || timestampNumber < 0) {
+          this.synth.recordDroppedMidiEvents(messages.length || 1);
+          throw new TypeError("MIDIOutput.send() timestamp must be a finite non-negative number.");
+        }
+
+        const sendTimestamp = timestampNumber > now ? timestampNumber : now;
+        for (const message of messages) {
+          this.enqueueMessage(message, sendTimestamp);
+        }
+      }
+      this.flushQueue();
+    }
+
+    enqueueMessage(bytes, timestamp) {
+      const item = {
+        bytes,
+        timestamp,
+        sequence: this.queueSequence
+      };
+      this.queueSequence += 1;
+
+      const last = this.queue[this.queue.length - 1];
+      if (!last || compareQueuedMidiMessage(last, item) <= 0) {
+        this.queue.push(item);
+        return;
+      }
+
+      let low = 0;
+      let high = this.queue.length;
+      while (low < high) {
+        const middle = (low + high) >> 1;
+        if (compareQueuedMidiMessage(this.queue[middle], item) <= 0) {
+          low = middle + 1;
+        } else {
+          high = middle;
+        }
+      }
+      this.queue.splice(low, 0, item);
+    }
+
+    clear() {
+      this.recordDroppedQueuedEvents();
+      this.queue.length = 0;
+      this.scheduler.stop();
+      this.synth.allSoundOff();
+    }
+
+    preload() {
+      return this.synth.preload();
+    }
+
+    flushQueue() {
+      if (!this.queue.length) {
+        this.scheduler.stop();
+        return;
+      }
+
+      const now = performanceNow();
+      const horizon = now + this.lookaheadMs;
+      let sent = 0;
+      while (this.queue.length && this.queue[0].timestamp <= horizon && sent < this.maxMessagesPerTick) {
+        const item = this.queue.shift();
+        const delaySeconds = Math.max(0, (item.timestamp - now) / 1000);
+        this.synth.dispatchMidi(item.bytes, delaySeconds);
+        sent += 1;
+      }
+
+      if (this.queue.length) {
+        this.scheduler.start();
+      } else {
+        this.scheduler.stop();
+      }
+    }
+
+    emitStateChange() {
+      this.dispatchEvent(createMIDIConnectionEvent(this));
+      if (this.access) {
+        this.access.emitPortStateChange(this);
+      }
+    }
+
+    recordDroppedQueuedEvents() {
+      if (this.queue.length) {
+        this.synth.recordDroppedMidiEvents(this.queue.length);
+      }
     }
   }
 
-  function firstMapValue(map) {
-    return map.values().next().value;
-  }
+  let installedShim = null;
 
-  function midiPortValues(collection) {
-    if (!collection) {
-      return [];
+  function installWebMidiAudioShim(options = {}) {
+    const targetNavigator = options.navigator || globalThis.navigator;
+    if (!targetNavigator) {
+      throw new Error("A navigator object is required to install the Web MIDI audio shim.");
     }
-    if (typeof collection.values === "function") {
-      return Array.from(collection.values());
+
+    if (installedShim && !options.force) {
+      return installedShim;
     }
-    if (typeof collection.forEach === "function") {
-      const values = [];
-      collection.forEach((value) => values.push(value));
-      return values;
+
+    if (installedShim && options.force) {
+      installedShim.restore();
     }
-    return [];
+
+    const previousRequestMIDIAccess = targetNavigator.requestMIDIAccess;
+    let masterGainValue = normalizeMasterGain(options.masterGain, DEFAULT_MASTER_GAIN);
+    let passthroughRealMidi = options.passthroughRealMidi !== false;
+    let maxVoicesValue = normalizeVoiceLimit(options.maxVoices, DEFAULT_MAX_VOICES, 8, 512);
+    let maxVoicesPerChannelValue = normalizeVoiceLimit(options.maxVoicesPerChannel, DEFAULT_MAX_VOICES_PER_CHANNEL, 4, 256);
+    maxVoicesValue = Math.max(maxVoicesValue, maxVoicesPerChannelValue);
+    const defaultSynth = new EmbeddedSoundFontSynth({
+      audioContext: options.audioContext,
+      soundFontBase64: options.soundFontBase64,
+      soundFontUrl: options.soundFontUrl,
+      soundFontCacheKey: options.soundFontCacheKey,
+      cacheSoundFont: options.cacheSoundFont,
+      progress: options.progress,
+      masterGain: masterGainValue,
+      maxVoices: maxVoicesValue,
+      maxVoicesPerChannel: maxVoicesPerChannelValue
+    });
+    const defaultDevice = {
+      id: options.outputId || DEFAULT_OUTPUT_ID,
+      key: DEFAULT_SOUNDFONT_CACHE_KEY,
+      name: options.outputName || "GeneralUser GS Web Audio",
+      builtIn: true,
+      synth: defaultSynth
+    };
+    const devices = new Map([[defaultDevice.id, defaultDevice]]);
+    const accessBySysex = new Map();
+    const accessRequestOptionsBySysex = new Map();
+    const nativeAccessPromisesBySysex = new Map();
+    let settingsReady = Promise.resolve();
+
+    function orderedDevices() {
+      return Array.from(devices.values());
+    }
+
+    function syncDeviceToAccesses(device) {
+      for (const access of accessBySysex.values()) {
+        access.addOutputDevice(device);
+      }
+    }
+
+    function removeDeviceFromAccesses(deviceId) {
+      for (const access of accessBySysex.values()) {
+        access.removeOutputDevice(deviceId);
+      }
+    }
+
+    function renameDeviceInAccesses(deviceId, name) {
+      for (const access of accessBySysex.values()) {
+        access.renameOutputDevice(deviceId, name);
+      }
+    }
+
+    function registerCustomSoundFont(record) {
+      if (!record?.key || devices.has(record.key)) {
+        return null;
+      }
+      const device = {
+        id: record.key,
+        key: record.key,
+        name: record.name || record.key,
+        builtIn: false,
+        source: record.source || "",
+        synth: new EmbeddedSoundFontSynth({
+          audioContext: options.audioContext,
+          soundFontUrl: record.url || null,
+          soundFontCacheKey: record.key,
+          cacheSoundFont: true,
+          progress: options.progress === false ? false : null,
+          masterGain: masterGainValue,
+          maxVoices: maxVoicesValue,
+          maxVoicesPerChannel: maxVoicesPerChannelValue
+        })
+      };
+      devices.set(device.id, device);
+      syncDeviceToAccesses(device);
+      return device;
+    }
+
+    function getAccess(requestOptions = {}) {
+      const sysexEnabled = !!requestOptions.sysex;
+      accessRequestOptionsBySysex.set(sysexEnabled, requestOptions);
+      if (!accessBySysex.has(sysexEnabled)) {
+        accessBySysex.set(sysexEnabled, new VirtualMIDIAccess(orderedDevices(), {
+          ...options,
+          sysexEnabled,
+          lookaheadMs: options.lookaheadMs ?? DEFAULT_LOOKAHEAD_MS,
+          schedulerIntervalMs: options.schedulerIntervalMs ?? DEFAULT_SCHEDULER_INTERVAL_MS,
+          maxMessagesPerTick: options.maxMessagesPerTick ?? DEFAULT_MAX_MESSAGES_PER_TICK
+        }));
+      }
+      return accessBySysex.get(sysexEnabled);
+    }
+
+    async function requestMIDIAccess(requestOptions = {}) {
+      await settingsReady;
+      const access = getAccess(requestOptions);
+      await syncNativeMIDIAccess(requestOptions, access);
+      return access;
+    }
+
+    function applyMasterGain(value, persist = true) {
+      masterGainValue = normalizeMasterGain(value, masterGainValue);
+      for (const device of devices.values()) {
+        device.synth.setMasterGain(masterGainValue);
+      }
+      if (persist) {
+        writeSoundFontSettings({ masterGain: masterGainValue });
+      }
+      return masterGainValue;
+    }
+
+    async function applyPassthroughRealMidi(enabled, persist = true) {
+      passthroughRealMidi = enabled !== false;
+      if (persist) {
+        writeSoundFontSettings({ passthroughRealMidi });
+      }
+      if (!passthroughRealMidi) {
+        for (const access of accessBySysex.values()) {
+          access.detachNativeAccess();
+        }
+        return passthroughRealMidi;
+      }
+      await syncAllNativeMIDIAccesses();
+      return passthroughRealMidi;
+    }
+
+    function applyVoiceLimits(limits = {}, persist = true) {
+      maxVoicesValue = normalizeVoiceLimit(limits.maxVoices, maxVoicesValue, 8, 512);
+      maxVoicesPerChannelValue = normalizeVoiceLimit(limits.maxVoicesPerChannel, maxVoicesPerChannelValue, 4, 256);
+      if (maxVoicesValue < maxVoicesPerChannelValue) {
+        maxVoicesValue = maxVoicesPerChannelValue;
+      }
+      for (const device of devices.values()) {
+        device.synth.setVoiceLimits(maxVoicesValue, maxVoicesPerChannelValue);
+      }
+      if (persist) {
+        writeSoundFontSettings({
+          maxVoices: maxVoicesValue,
+          maxVoicesPerChannel: maxVoicesPerChannelValue
+        });
+      }
+      return {
+        maxVoices: maxVoicesValue,
+        maxVoicesPerChannel: maxVoicesPerChannelValue
+      };
+    }
+
+    async function syncAllNativeMIDIAccesses() {
+      const tasks = [];
+      for (const [sysexEnabled, access] of accessBySysex) {
+        tasks.push(syncNativeMIDIAccess(accessRequestOptionsBySysex.get(sysexEnabled) || { sysex: sysexEnabled }, access));
+      }
+      await Promise.all(tasks);
+    }
+
+    async function syncNativeMIDIAccess(requestOptions = {}, access = getAccess(requestOptions)) {
+      if (!passthroughRealMidi) {
+        access.detachNativeAccess();
+        return access;
+      }
+      if (typeof previousRequestMIDIAccess !== "function") {
+        return access;
+      }
+
+      const sysexEnabled = !!requestOptions.sysex;
+      if (!nativeAccessPromisesBySysex.has(sysexEnabled)) {
+        nativeAccessPromisesBySysex.set(sysexEnabled, Promise.resolve()
+          .then(() => previousRequestMIDIAccess.call(targetNavigator, requestOptions))
+          .catch(() => null));
+      }
+      const nativeAccess = await nativeAccessPromisesBySysex.get(sysexEnabled);
+      if (nativeAccess && passthroughRealMidi) {
+        access.attachNativeAccess(nativeAccess);
+      }
+      return access;
+    }
+
+    defineRequestMIDIAccess(targetNavigator, requestMIDIAccess);
+
+    installedShim = {
+      get access() {
+        return getAccess();
+      },
+      getAccess,
+      synth: defaultSynth,
+      previousRequestMIDIAccess,
+      restore() {
+        for (const access of accessBySysex.values()) {
+          for (const output of access.outputs.values()) {
+            if (typeof output.clear === "function") {
+              output.clear();
+            }
+          }
+          access.detachNativeAccess();
+        }
+        if (previousRequestMIDIAccess) {
+          defineRequestMIDIAccess(targetNavigator, previousRequestMIDIAccess);
+        } else {
+          delete targetNavigator.requestMIDIAccess;
+        }
+        installedShim = null;
+      },
+      preload() {
+        return defaultSynth.preload();
+      },
+      clearSoundFontCache() {
+        return defaultSynth.clearCache();
+      },
+      getMasterGain() {
+        return masterGainValue;
+      },
+      setMasterGain(value) {
+        return applyMasterGain(value);
+      },
+      getPassthroughRealMidi() {
+        return passthroughRealMidi;
+      },
+      setPassthroughRealMidi(enabled) {
+        return applyPassthroughRealMidi(enabled);
+      },
+      getVoiceLimits() {
+        return {
+          maxVoices: maxVoicesValue,
+          maxVoicesPerChannel: maxVoicesPerChannelValue
+        };
+      },
+      setVoiceLimits(limits) {
+        return applyVoiceLimits(limits);
+      },
+      getPerformanceStats() {
+        return aggregatePerformanceStats(orderedDevices());
+      },
+      listSoundFontDevices() {
+        return orderedDevices().map((device) => publicSoundFontDevice(device));
+      },
+      async installSoundFontFromArrayBuffer(arrayBuffer, metadata = {}) {
+        const key = metadata.key || createCustomSoundFontKey(metadata.name || metadata.fileName || metadata.url || "Custom SF2");
+        const name = cleanSoundFontName(metadata.name || metadata.fileName || metadata.url || "Custom SF2");
+        await writeCachedSoundFont(key, arrayBuffer, {
+          ...metadata,
+          key,
+          name,
+          custom: true
+        });
+        const device = registerCustomSoundFont({
+          key,
+          name,
+          source: metadata.source || "file",
+          url: metadata.url || ""
+        });
+        return publicSoundFontDevice(device);
+      },
+      async installSoundFontFromUrl(url, metadata = {}) {
+        const progress = createSoundFontProgressOverlay();
+        const arrayBuffer = await downloadSoundFont(url, progress);
+        return this.installSoundFontFromArrayBuffer(arrayBuffer, {
+          ...metadata,
+          name: metadata.name || fileNameFromUrl(url) || "Remote SF2",
+          source: "url",
+          url
+        });
+      },
+      async uninstallSoundFont(deviceId) {
+        const device = devices.get(deviceId);
+        if (!device || device.builtIn) {
+          return false;
+        }
+        device.synth.clear();
+        devices.delete(deviceId);
+        await deleteCachedSoundFont(device.key);
+        removeDeviceFromAccesses(deviceId);
+        return true;
+      },
+      async renameSoundFontDevice(deviceId, name) {
+        const device = devices.get(deviceId);
+        if (!device || device.builtIn) {
+          return null;
+        }
+        const cleanName = cleanSoundFontName(name);
+        device.name = cleanName;
+        await updateCachedSoundFontMetadata(device.key, { name: cleanName });
+        renameDeviceInAccesses(deviceId, cleanName);
+        return publicSoundFontDevice(device);
+      },
+      openSettings() {
+        openSoundFontSettingsPanel(installedShim);
+      }
+    };
+
+    settingsReady = Promise.all([
+      loadInstalledSoundFontRecords(),
+      options.masterGain === undefined ? readSoundFontSettings() : Promise.resolve({})
+    ])
+      .then(([records, settings]) => {
+        for (const record of records) {
+          registerCustomSoundFont(record);
+        }
+        if (options.masterGain === undefined && settings?.masterGain != null) {
+          applyMasterGain(settings.masterGain, false);
+        }
+        if (options.passthroughRealMidi === undefined && settings?.passthroughRealMidi != null) {
+          applyPassthroughRealMidi(settings.passthroughRealMidi, false);
+        }
+        if ((options.maxVoices === undefined && settings?.maxVoices != null) || (options.maxVoicesPerChannel === undefined && settings?.maxVoicesPerChannel != null)) {
+          applyVoiceLimits({
+            maxVoices: options.maxVoices === undefined ? settings?.maxVoices : maxVoicesValue,
+            maxVoicesPerChannel: options.maxVoicesPerChannel === undefined ? settings?.maxVoicesPerChannel : maxVoicesPerChannelValue
+          }, false);
+        }
+      })
+      .catch(() => {
+        // Settings should never block MIDI installation.
+      });
+
+    registerSettingsMenu(installedShim);
+
+    return installedShim;
   }
 
-  function validRange(range) {
-    return !range || range[0] <= range[1];
+  function getInstalledWebMidiAudioShim() {
+    return installedShim;
   }
 
-  function intersectRanges(a, b) {
-    return [Math.max(a[0], b[0]), Math.min(a[1], b[1])];
+  async function preloadEmbeddedSoundFont() {
+    const shim = installedShim || installWebMidiAudioShim();
+    await shim.preload();
+    return shim.synth;
   }
 
-  function clamp(value, min, max) {
-    return Math.min(max, Math.max(min, value));
+  function clearSoundFontCache(cacheKey = DEFAULT_SOUNDFONT_CACHE_KEY) {
+    return deleteCachedSoundFont(cacheKey);
   }
 
-  function performanceNow() {
-    return typeof performance !== "undefined" ? performance.now() : Date.now();
-  }
+  async function playMidiFile(arrayBuffer, options = {}) {
+    const events = parseMidiFile(arrayBuffer);
+    const access = options.access || installedShim?.getAccess?.({ sysex: true }) || await navigator.requestMIDIAccess({ sysex: true });
+    const output = options.output || firstMapValue(access.outputs);
+    if (!output) {
+      throw new Error("No MIDI output is available.");
+    }
+    if (typeof output.preload === "function") {
+      await output.preload();
+    }
 
-  function pageGlobalThis() {
-    return typeof unsafeWindow !== "undefined" ? unsafeWindow : globalThis;
+    const playbackRate = options.playbackRate || 1;
+    const lookaheadMs = positiveNumberOrDefault(options.lookaheadMs, DEFAULT_LOOKAHEAD_MS, MIN_LOOKAHEAD_MS);
+    const schedulerIntervalMs = positiveNumberOrDefault(options.schedulerIntervalMs, DEFAULT_SCHEDULER_INTERVAL_MS, MIN_SCHEDULER_INTERVAL_MS);
+    const maxEventsPerTick = positiveIntegerOrDefault(options.maxEventsPerTick, DEFAULT_MAX_MESSAGES_PER_TICK);
+    const startedAt = performanceNow() + (options.startDelayMs || 0);
+    let cursor = 0;
+    let stopped = false;
+    const scheduler = new LookaheadScheduler({
+      intervalMs: schedulerIntervalMs,
+      onTick() {
+        if (stopped) {
+          return;
+        }
+        const horizon = performanceNow() + lookaheadMs;
+        const batch = [];
+        while (cursor < events.length && batch.length < maxEventsPerTick) {
+          const eventTimestamp = startedAt + events[cursor].timeMs / playbackRate;
+          if (eventTimestamp > horizon) {
+            break;
+          }
+          batch.push({
+            data: events[cursor].data,
+            timestamp: eventTimestamp
+          });
+          cursor += 1;
+        }
+        scheduleOutputMessages(output, batch);
+        if (cursor >= events.length) {
+          scheduler.stop();
+        }
+      }
+    });
+
+    scheduler.start();
+    scheduler.tick();
+
+    return {
+      durationMs: events.length ? events[events.length - 1].timeMs / playbackRate : 0,
+      startedAt,
+      stop() {
+        stopped = true;
+        scheduler.stop();
+        if (typeof output.clear === "function") {
+          output.clear();
+        }
+      }
+    };
   }
 
   if (typeof window !== "undefined" && !pageGlobalThis().__WEB_MIDI_AUDIO_SHIM_NO_AUTO_INSTALL__) {
