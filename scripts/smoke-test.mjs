@@ -208,7 +208,7 @@ function createFakeIndexedDB() {
   }
 }
 
-function loadBundle({ fakeClock = true } = {}) {
+function loadBundle({ fakeClock = true, nativeRequestMIDIAccess = null } = {}) {
   const code = fs.readFileSync("dist/sf2.user.js", "utf8")
   const soundFontBytes = fs.readFileSync("assets/GeneralUser-GS.sf2")
   const soundFontUrl = "https://raw.githubusercontent.com/fred913/midi-sf2-web/main/assets/GeneralUser-GS.sf2"
@@ -222,7 +222,7 @@ function loadBundle({ fakeClock = true } = {}) {
     console,
     clearInterval,
     clearTimeout,
-    navigator: {},
+    navigator: nativeRequestMIDIAccess ? { requestMIDIAccess: nativeRequestMIDIAccess } : {},
     setInterval,
     setTimeout,
     GM_registerMenuCommand: (name, callback) => {
@@ -361,6 +361,86 @@ async function testMasterGainControls() {
   assert.equal(shim.setMasterGain(2), 1.5)
   assert.equal(output.synth.masterGain.gain.value, 1.5)
   assert.equal(shim.setMasterGain("bad"), 1.5)
+}
+
+async function testPassthroughRealMidiDevices() {
+  const realInput = {
+    id: "real-input",
+    name: "Real MIDI In",
+    type: "input",
+    state: "connected",
+    connection: "open"
+  }
+  const realOutput = {
+    id: "real-output",
+    name: "Real MIDI Out",
+    type: "output",
+    state: "connected",
+    connection: "closed",
+    send() {}
+  }
+  const nativeAccess = {
+    inputs: new Map([[realInput.id, realInput]]),
+    outputs: new Map([[realOutput.id, realOutput]]),
+    listeners: new Set(),
+    addEventListener(type, listener) {
+      if (type === "statechange") {
+        this.listeners.add(listener)
+      }
+    },
+    removeEventListener(type, listener) {
+      if (type === "statechange") {
+        this.listeners.delete(listener)
+      }
+    }
+  }
+  const requested = []
+  const context = loadBundle({
+    nativeRequestMIDIAccess: async (options) => {
+      requested.push(options)
+      return nativeAccess
+    }
+  })
+  const shim = context.WebMidiAudioShim.getInstalledWebMidiAudioShim()
+  const access = await context.navigator.requestMIDIAccess({ sysex: true })
+
+  assert.equal(shim.getPassthroughRealMidi(), true)
+  assert.equal(requested.length, 1)
+  assert.equal(requested[0].sysex, true)
+  assert.equal(access.inputs.get(realInput.id), realInput)
+  assert.equal(access.outputs.get(realOutput.id), realOutput)
+  assert.equal(access.outputs.has("generaluser-gs-web-audio"), true)
+
+  await shim.setPassthroughRealMidi(false)
+  assert.equal(shim.getPassthroughRealMidi(), false)
+  assert.equal(access.inputs.has(realInput.id), false)
+  assert.equal(access.outputs.has(realOutput.id), false)
+
+  await shim.setPassthroughRealMidi(true)
+  assert.equal(shim.getPassthroughRealMidi(), true)
+  assert.equal(access.inputs.get(realInput.id), realInput)
+  assert.equal(access.outputs.get(realOutput.id), realOutput)
+}
+
+async function testVoiceLimitControls() {
+  const context = loadBundle()
+  const shim = context.WebMidiAudioShim.getInstalledWebMidiAudioShim()
+  const access = await context.navigator.requestMIDIAccess()
+  const output = outputFrom(access)
+
+  let limits = shim.getVoiceLimits()
+  assert.equal(limits.maxVoices, 192)
+  assert.equal(limits.maxVoicesPerChannel, 64)
+
+  limits = shim.setVoiceLimits({ maxVoices: 16, maxVoicesPerChannel: 9 })
+  assert.equal(limits.maxVoices, 16)
+  assert.equal(limits.maxVoicesPerChannel, 9)
+  assert.equal(output.synth.maxVoices, 16)
+  assert.equal(output.synth.maxVoicesPerChannel, 9)
+
+  limits = shim.setVoiceLimits({ maxVoices: 2, maxVoicesPerChannel: 999 })
+  assert.equal(limits.maxVoices, 256)
+  assert.equal(limits.maxVoicesPerChannel, 256)
 }
 
 async function testPerformanceStats() {
@@ -552,6 +632,8 @@ testUserscriptHeader()
 await testAccessAndPortState()
 await testSendValidationAndQueue()
 await testMasterGainControls()
+await testPassthroughRealMidiDevices()
+await testVoiceLimitControls()
 await testPerformanceStats()
 await testDeferredSendWhileSoundFontDownloads()
 await testIndexedDbSoundFontCache()

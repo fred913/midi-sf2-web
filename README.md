@@ -44,11 +44,11 @@ Open `http://127.0.0.1:4173/demo/index.html`, initialize the shim, then play C4 
 
 The shim implements an output-only Web MIDI surface with `MIDIAccess.sysexEnabled`, `onstatechange`, `MIDIPort.open()`, `MIDIPort.close()`, queued `MIDIOutput.send(data, timestamp)`, and `MIDIOutput.clear()`. The bundle also exposes `WebMidiAudioShim.playMidiFile(arrayBuffer)`, which uses a lookahead scheduler for Standard MIDI files and recognizes common GM/GS reset messages.
 
-Playback is capped to avoid runaway CPU on dense files: defaults are `maxVoices: 96`, `maxVoicesPerChannel: 32`, and `maxMessagesPerTick: 4096`. `playMidiFile()` also accepts `lookaheadMs`, `schedulerIntervalMs`, and `maxEventsPerTick` overrides for tuning. Output gain defaults to `0.3` with a Web Audio limiter; it can be changed from `SF2 Settings` or with `WebMidiAudioShim.getInstalledWebMidiAudioShim().setMasterGain(value)`.
+Playback is capped to avoid runaway CPU on dense files: defaults are `maxVoices: 192`, `maxVoicesPerChannel: 64`, and `maxMessagesPerTick: 4096`. `playMidiFile()` also accepts `lookaheadMs`, `schedulerIntervalMs`, and `maxEventsPerTick` overrides for tuning. Output gain defaults to `0.3` with a Web Audio limiter; output gain and voice limits can be changed from `SF2 Settings`.
 
 The SoundFont cache can be cleared with `WebMidiAudioShim.clearSoundFontCache()` or `WebMidiAudioShim.getInstalledWebMidiAudioShim().clearSoundFontCache()`.
 
-Tampermonkey's menu exposes `SF2 Settings`. The settings panel can install a new `.sf2` by drag and drop, file picker, or URL; each installed SoundFont appears as a separate virtual MIDI output. It also shows live per-device performance counters for MIDI events per second, played notes per second, dropped events, dropped notes, and active voices. Custom devices can be renamed or uninstalled from the panel, while MIDI output selection is left to the page through `MIDIAccess.outputs`.
+Tampermonkey's menu exposes `SF2 Settings`. The settings panel can install a new `.sf2` by drag and drop, file picker, or URL; each installed SoundFont appears as a separate virtual MIDI output. `Passthrough real MIDI devices` is enabled by default, so native browser MIDI inputs and outputs remain visible alongside SF2 outputs when Web MIDI is available. The panel also shows live per-device performance counters for MIDI events per second, played notes per second, dropped events, dropped notes, and active voices. Custom devices can be renamed or uninstalled from the panel, while MIDI output selection is left to the page through `MIDIAccess.outputs`.
 
 ## License
 

@@ -14,8 +14,8 @@ const DEFAULT_SCHEDULER_INTERVAL_MS = 25;
 const MIN_LOOKAHEAD_MS = 10;
 const MIN_SCHEDULER_INTERVAL_MS = 8;
 const DEFAULT_MAX_MESSAGES_PER_TICK = 4096;
-const DEFAULT_MAX_VOICES = 96;
-const DEFAULT_MAX_VOICES_PER_CHANNEL = 32;
+const DEFAULT_MAX_VOICES = 192;
+const DEFAULT_MAX_VOICES_PER_CHANNEL = 64;
 const GM_SYSTEM_ON = [0xf0, 0x7e, null, 0x09, 0x01, 0xf7];
 const GM2_SYSTEM_ON = [0xf0, 0x7e, null, 0x09, 0x03, 0xf7];
 const GS_RESET_PREFIX = [0xf0, 0x41, null, 0x42, 0x12, 0x40, 0x00, 0x7f, 0x00];
@@ -80,6 +80,10 @@ export function installWebMidiAudioShim(options = {}) {
 
   const previousRequestMIDIAccess = targetNavigator.requestMIDIAccess;
   let masterGainValue = normalizeMasterGain(options.masterGain, DEFAULT_MASTER_GAIN);
+  let passthroughRealMidi = options.passthroughRealMidi !== false;
+  let maxVoicesValue = normalizeVoiceLimit(options.maxVoices, DEFAULT_MAX_VOICES, 8, 512);
+  let maxVoicesPerChannelValue = normalizeVoiceLimit(options.maxVoicesPerChannel, DEFAULT_MAX_VOICES_PER_CHANNEL, 4, 256);
+  maxVoicesValue = Math.max(maxVoicesValue, maxVoicesPerChannelValue);
   const defaultSynth = new EmbeddedSoundFontSynth({
     audioContext: options.audioContext,
     soundFontBase64: options.soundFontBase64,
@@ -87,7 +91,9 @@ export function installWebMidiAudioShim(options = {}) {
     soundFontCacheKey: options.soundFontCacheKey,
     cacheSoundFont: options.cacheSoundFont,
     progress: options.progress,
-    masterGain: masterGainValue
+    masterGain: masterGainValue,
+    maxVoices: maxVoicesValue,
+    maxVoicesPerChannel: maxVoicesPerChannelValue
   });
   const defaultDevice = {
     id: options.outputId || DEFAULT_OUTPUT_ID,
@@ -98,6 +104,9 @@ export function installWebMidiAudioShim(options = {}) {
   };
   const devices = new Map([[defaultDevice.id, defaultDevice]]);
   const accessBySysex = new Map();
+  const accessRequestOptionsBySysex = new Map();
+  const nativeAccessPromisesBySysex = new Map();
+  let settingsReady = Promise.resolve();
 
   function orderedDevices() {
     return Array.from(devices.values());
@@ -137,7 +146,9 @@ export function installWebMidiAudioShim(options = {}) {
         soundFontCacheKey: record.key,
         cacheSoundFont: true,
         progress: options.progress === false ? false : null,
-        masterGain: masterGainValue
+        masterGain: masterGainValue,
+        maxVoices: maxVoicesValue,
+        maxVoicesPerChannel: maxVoicesPerChannelValue
       })
     };
     devices.set(device.id, device);
@@ -147,6 +158,7 @@ export function installWebMidiAudioShim(options = {}) {
 
   function getAccess(requestOptions = {}) {
     const sysexEnabled = !!requestOptions.sysex;
+    accessRequestOptionsBySysex.set(sysexEnabled, requestOptions);
     if (!accessBySysex.has(sysexEnabled)) {
       accessBySysex.set(sysexEnabled, new VirtualMIDIAccess(orderedDevices(), {
         ...options,
@@ -159,8 +171,11 @@ export function installWebMidiAudioShim(options = {}) {
     return accessBySysex.get(sysexEnabled);
   }
 
-  function requestMIDIAccess(requestOptions = {}) {
-    return Promise.resolve(getAccess(requestOptions));
+  async function requestMIDIAccess(requestOptions = {}) {
+    await settingsReady;
+    const access = getAccess(requestOptions);
+    await syncNativeMIDIAccess(requestOptions, access);
+    return access;
   }
 
   function applyMasterGain(value, persist = true) {
@@ -172,6 +187,72 @@ export function installWebMidiAudioShim(options = {}) {
       writeSoundFontSettings({ masterGain: masterGainValue });
     }
     return masterGainValue;
+  }
+
+  async function applyPassthroughRealMidi(enabled, persist = true) {
+    passthroughRealMidi = enabled !== false;
+    if (persist) {
+      writeSoundFontSettings({ passthroughRealMidi });
+    }
+    if (!passthroughRealMidi) {
+      for (const access of accessBySysex.values()) {
+        access.detachNativeAccess();
+      }
+      return passthroughRealMidi;
+    }
+    await syncAllNativeMIDIAccesses();
+    return passthroughRealMidi;
+  }
+
+  function applyVoiceLimits(limits = {}, persist = true) {
+    maxVoicesValue = normalizeVoiceLimit(limits.maxVoices, maxVoicesValue, 8, 512);
+    maxVoicesPerChannelValue = normalizeVoiceLimit(limits.maxVoicesPerChannel, maxVoicesPerChannelValue, 4, 256);
+    if (maxVoicesValue < maxVoicesPerChannelValue) {
+      maxVoicesValue = maxVoicesPerChannelValue;
+    }
+    for (const device of devices.values()) {
+      device.synth.setVoiceLimits(maxVoicesValue, maxVoicesPerChannelValue);
+    }
+    if (persist) {
+      writeSoundFontSettings({
+        maxVoices: maxVoicesValue,
+        maxVoicesPerChannel: maxVoicesPerChannelValue
+      });
+    }
+    return {
+      maxVoices: maxVoicesValue,
+      maxVoicesPerChannel: maxVoicesPerChannelValue
+    };
+  }
+
+  async function syncAllNativeMIDIAccesses() {
+    const tasks = [];
+    for (const [sysexEnabled, access] of accessBySysex) {
+      tasks.push(syncNativeMIDIAccess(accessRequestOptionsBySysex.get(sysexEnabled) || { sysex: sysexEnabled }, access));
+    }
+    await Promise.all(tasks);
+  }
+
+  async function syncNativeMIDIAccess(requestOptions = {}, access = getAccess(requestOptions)) {
+    if (!passthroughRealMidi) {
+      access.detachNativeAccess();
+      return access;
+    }
+    if (typeof previousRequestMIDIAccess !== "function") {
+      return access;
+    }
+
+    const sysexEnabled = !!requestOptions.sysex;
+    if (!nativeAccessPromisesBySysex.has(sysexEnabled)) {
+      nativeAccessPromisesBySysex.set(sysexEnabled, Promise.resolve()
+        .then(() => previousRequestMIDIAccess.call(targetNavigator, requestOptions))
+        .catch(() => null));
+    }
+    const nativeAccess = await nativeAccessPromisesBySysex.get(sysexEnabled);
+    if (nativeAccess && passthroughRealMidi) {
+      access.attachNativeAccess(nativeAccess);
+    }
+    return access;
   }
 
   defineRequestMIDIAccess(targetNavigator, requestMIDIAccess);
@@ -186,8 +267,11 @@ export function installWebMidiAudioShim(options = {}) {
     restore() {
       for (const access of accessBySysex.values()) {
         for (const output of access.outputs.values()) {
-          output.clear();
+          if (typeof output.clear === "function") {
+            output.clear();
+          }
         }
+        access.detachNativeAccess();
       }
       if (previousRequestMIDIAccess) {
         defineRequestMIDIAccess(targetNavigator, previousRequestMIDIAccess);
@@ -207,6 +291,21 @@ export function installWebMidiAudioShim(options = {}) {
     },
     setMasterGain(value) {
       return applyMasterGain(value);
+    },
+    getPassthroughRealMidi() {
+      return passthroughRealMidi;
+    },
+    setPassthroughRealMidi(enabled) {
+      return applyPassthroughRealMidi(enabled);
+    },
+    getVoiceLimits() {
+      return {
+        maxVoices: maxVoicesValue,
+        maxVoicesPerChannel: maxVoicesPerChannelValue
+      };
+    },
+    setVoiceLimits(limits) {
+      return applyVoiceLimits(limits);
     },
     getPerformanceStats() {
       return aggregatePerformanceStats(orderedDevices());
@@ -268,7 +367,7 @@ export function installWebMidiAudioShim(options = {}) {
     }
   };
 
-  Promise.all([
+  settingsReady = Promise.all([
     loadInstalledSoundFontRecords(),
     options.masterGain === undefined ? readSoundFontSettings() : Promise.resolve({})
   ])
@@ -278,6 +377,15 @@ export function installWebMidiAudioShim(options = {}) {
       }
       if (options.masterGain === undefined && settings?.masterGain != null) {
         applyMasterGain(settings.masterGain, false);
+      }
+      if (options.passthroughRealMidi === undefined && settings?.passthroughRealMidi != null) {
+        applyPassthroughRealMidi(settings.passthroughRealMidi, false);
+      }
+      if ((options.maxVoices === undefined && settings?.maxVoices != null) || (options.maxVoicesPerChannel === undefined && settings?.maxVoicesPerChannel != null)) {
+        applyVoiceLimits({
+          maxVoices: options.maxVoices === undefined ? settings?.maxVoices : maxVoicesValue,
+          maxVoicesPerChannel: options.maxVoicesPerChannel === undefined ? settings?.maxVoicesPerChannel : maxVoicesPerChannelValue
+        }, false);
       }
     })
     .catch(() => {
@@ -561,6 +669,10 @@ class VirtualMIDIAccess extends SimpleEventTarget {
     this.inputs = new Map();
     this.outputs = new Map();
     this.outputOptions = options;
+    this.nativeAccess = null;
+    this.nativeInputIds = new Set();
+    this.nativeOutputIds = new Set();
+    this.nativeStateListener = null;
 
     for (const device of devices) {
       this.addOutputDevice(device, false);
@@ -587,6 +699,94 @@ class VirtualMIDIAccess extends SimpleEventTarget {
     this.outputs.set(output.id, output);
     if (notify) {
       this.emitPortStateChange(output);
+    }
+  }
+
+  attachNativeAccess(nativeAccess) {
+    if (!nativeAccess) {
+      return;
+    }
+    if (this.nativeAccess && this.nativeAccess !== nativeAccess) {
+      this.detachNativeAccess();
+    }
+    this.nativeAccess = nativeAccess;
+    if (!this.nativeStateListener) {
+      this.nativeStateListener = (event) => {
+        this.syncNativePorts(true);
+        if (event?.port) {
+          this.emitPortStateChange(event.port);
+        }
+      };
+      if (typeof nativeAccess.addEventListener === "function") {
+        nativeAccess.addEventListener("statechange", this.nativeStateListener);
+      }
+    }
+    this.syncNativePorts(true);
+  }
+
+  detachNativeAccess() {
+    if (!this.nativeAccess && !this.nativeInputIds.size && !this.nativeOutputIds.size) {
+      return;
+    }
+    if (this.nativeAccess && this.nativeStateListener && typeof this.nativeAccess.removeEventListener === "function") {
+      this.nativeAccess.removeEventListener("statechange", this.nativeStateListener);
+    }
+    for (const id of this.nativeInputIds) {
+      const port = this.inputs.get(id);
+      this.inputs.delete(id);
+      if (port) {
+        this.emitPortStateChange(port);
+      }
+    }
+    for (const id of this.nativeOutputIds) {
+      const port = this.outputs.get(id);
+      this.outputs.delete(id);
+      if (port) {
+        this.emitPortStateChange(port);
+      }
+    }
+    this.nativeAccess = null;
+    this.nativeStateListener = null;
+    this.nativeInputIds.clear();
+    this.nativeOutputIds.clear();
+  }
+
+  syncNativePorts(notify = true) {
+    if (!this.nativeAccess) {
+      return;
+    }
+    this.syncNativePortMap("inputs", this.nativeAccess.inputs, this.nativeInputIds, notify);
+    this.syncNativePortMap("outputs", this.nativeAccess.outputs, this.nativeOutputIds, notify);
+  }
+
+  syncNativePortMap(kind, source, trackedIds, notify) {
+    const target = this[kind];
+    const seen = new Set();
+    for (const port of midiPortValues(source)) {
+      if (!port?.id) {
+        continue;
+      }
+      seen.add(port.id);
+      if (target.has(port.id) && !trackedIds.has(port.id)) {
+        continue;
+      }
+      const previous = target.get(port.id);
+      target.set(port.id, port);
+      trackedIds.add(port.id);
+      if (notify && previous !== port) {
+        this.emitPortStateChange(port);
+      }
+    }
+    for (const id of Array.from(trackedIds)) {
+      if (seen.has(id)) {
+        continue;
+      }
+      const port = target.get(id);
+      target.delete(id);
+      trackedIds.delete(id);
+      if (notify && port) {
+        this.emitPortStateChange(port);
+      }
     }
   }
 
@@ -1597,6 +1797,22 @@ class EmbeddedSoundFontSynth {
       setAudioParam(this.masterGain.gain, this.masterGainValue, this.audioContext.currentTime || 0);
     }
     return this.masterGainValue;
+  }
+
+  getVoiceLimits() {
+    return {
+      maxVoices: this.maxVoices,
+      maxVoicesPerChannel: this.maxVoicesPerChannel
+    };
+  }
+
+  setVoiceLimits(maxVoices, maxVoicesPerChannel) {
+    this.maxVoices = normalizeVoiceLimit(maxVoices, this.maxVoices, 8, 512);
+    this.maxVoicesPerChannel = normalizeVoiceLimit(maxVoicesPerChannel, this.maxVoicesPerChannel, 4, 256);
+    if (this.maxVoices < this.maxVoicesPerChannel) {
+      this.maxVoices = this.maxVoicesPerChannel;
+    }
+    return this.getVoiceLimits();
   }
 
   ensureSoundFont() {
@@ -2755,6 +2971,60 @@ function openSoundFontSettingsPanel(shim) {
   refreshGainValue();
   gainRow.append(gainLabel, gainInput, gainValue);
 
+  const passthroughRow = document.createElement("label");
+  passthroughRow.style.cssText = [
+    "display:flex",
+    "align-items:center",
+    "gap:8px",
+    "margin-bottom:14px",
+    "font-size:13px",
+    "cursor:pointer"
+  ].join(";");
+  const passthroughInput = document.createElement("input");
+  passthroughInput.type = "checkbox";
+  passthroughInput.checked = shim.getPassthroughRealMidi();
+  const passthroughLabel = document.createElement("span");
+  passthroughLabel.textContent = "Passthrough real MIDI devices";
+  passthroughInput.addEventListener("change", async () => {
+    passthroughInput.disabled = true;
+    try {
+      await shim.setPassthroughRealMidi(passthroughInput.checked);
+      setStatus(passthroughInput.checked ? "Real MIDI passthrough enabled" : "Real MIDI passthrough disabled");
+      refreshPerformanceStats();
+    } catch (error) {
+      passthroughInput.checked = shim.getPassthroughRealMidi();
+      setStatus(error?.message || "Could not update MIDI passthrough", true);
+    } finally {
+      passthroughInput.disabled = false;
+    }
+  });
+  passthroughRow.append(passthroughInput, passthroughLabel);
+
+  const voiceLimitsRow = document.createElement("div");
+  voiceLimitsRow.style.cssText = [
+    "display:grid",
+    "grid-template-columns:1fr 1fr",
+    "gap:10px",
+    "margin-bottom:14px"
+  ].join(";");
+  const maxVoicesInput = createNumberSettingInput("Max voices", shim.getVoiceLimits().maxVoices, 8, 512);
+  const maxVoicesPerChannelInput = createNumberSettingInput("Per channel", shim.getVoiceLimits().maxVoicesPerChannel, 4, 256);
+
+  async function applyVoiceLimitInputs() {
+    const limits = shim.setVoiceLimits({
+      maxVoices: maxVoicesInput.input.value,
+      maxVoicesPerChannel: maxVoicesPerChannelInput.input.value
+    });
+    maxVoicesInput.input.value = String(limits.maxVoices);
+    maxVoicesPerChannelInput.input.value = String(limits.maxVoicesPerChannel);
+    setStatus("Voice limits updated");
+    refreshPerformanceStats();
+  }
+
+  maxVoicesInput.input.addEventListener("change", applyVoiceLimitInputs);
+  maxVoicesPerChannelInput.input.addEventListener("change", applyVoiceLimitInputs);
+  voiceLimitsRow.append(maxVoicesInput.label, maxVoicesPerChannelInput.label);
+
   const performanceSection = document.createElement("div");
   performanceSection.style.cssText = [
     "border:1px solid #e2e8f0",
@@ -3009,10 +3279,33 @@ function openSoundFontSettingsPanel(shim) {
     }
   });
 
-  panel.append(titleRow, gainRow, performanceSection, dropZone, selectFileButton, fileInput, urlRow, status, devicesTitle, deviceList);
+  panel.append(titleRow, gainRow, passthroughRow, voiceLimitsRow, performanceSection, dropZone, selectFileButton, fileInput, urlRow, status, devicesTitle, deviceList);
   host.append(panel);
   document.documentElement.appendChild(host);
   refreshDevices();
+}
+
+function createNumberSettingInput(text, value, min, max) {
+  const label = document.createElement("label");
+  label.style.cssText = "display:flex;flex-direction:column;gap:4px;font-size:12px;color:#475569";
+  const title = document.createElement("span");
+  title.textContent = text;
+  const input = document.createElement("input");
+  input.type = "number";
+  input.min = String(min);
+  input.max = String(max);
+  input.step = "1";
+  input.value = String(value);
+  input.style.cssText = [
+    "box-sizing:border-box",
+    "width:100%",
+    "border:1px solid #cbd5e1",
+    "border-radius:6px",
+    "padding:7px 9px",
+    "font:inherit"
+  ].join(";");
+  label.append(title, input);
+  return { label, input };
 }
 
 function buttonStyle(variant = "normal") {
@@ -3267,6 +3560,11 @@ function normalizeMasterGain(value, fallback = DEFAULT_MASTER_GAIN) {
   return Number.isFinite(gain) ? clamp(gain, 0, 1.5) : fallback;
 }
 
+function normalizeVoiceLimit(value, fallback, min, max) {
+  const limit = Math.floor(Number(value));
+  return Number.isFinite(limit) ? clamp(limit, min, max) : fallback;
+}
+
 function requiredChunk(chunks, name) {
   const chunk = chunks.get(name);
   if (!chunk) {
@@ -3319,6 +3617,21 @@ function defineRequestMIDIAccess(targetNavigator, requestMIDIAccess) {
 
 function firstMapValue(map) {
   return map.values().next().value;
+}
+
+function midiPortValues(collection) {
+  if (!collection) {
+    return [];
+  }
+  if (typeof collection.values === "function") {
+    return Array.from(collection.values());
+  }
+  if (typeof collection.forEach === "function") {
+    const values = [];
+    collection.forEach((value) => values.push(value));
+    return values;
+  }
+  return [];
 }
 
 function validRange(range) {
