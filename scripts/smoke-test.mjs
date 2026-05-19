@@ -64,6 +64,17 @@ class FakeOscillator extends FakeNode {
   }
 }
 
+class FakeDynamicsCompressor extends FakeNode {
+  constructor() {
+    super()
+    this.threshold = new FakeAudioParam(0)
+    this.knee = new FakeAudioParam(0)
+    this.ratio = new FakeAudioParam(1)
+    this.attack = new FakeAudioParam(0)
+    this.release = new FakeAudioParam(0)
+  }
+}
+
 class FakeBufferSource extends FakeNode {
   constructor() {
     super()
@@ -115,6 +126,10 @@ class FakeAudioContext {
   createOscillator() {
     this.oscillatorCount += 1
     return new FakeOscillator()
+  }
+
+  createDynamicsCompressor() {
+    return new FakeDynamicsCompressor()
   }
 
   createBufferSource() {
@@ -296,6 +311,7 @@ async function testSendValidationAndQueue() {
 
   assert.throws(() => output.send([0x40, 0x7f]), /Running status/)
   assert.throws(() => output.send([0xf0, 0x7e, 0x7f, 0x09, 0x01, 0xf7]), /System Exclusive/)
+  assert.throws(() => output.send([0x90, 60, 300]), /0x00 and 0xFF/)
 
   output.send([0x90, 62])
   assert.equal(context.WebMidiAudioShim.getInstalledWebMidiAudioShim().synth.channels[0].activeNotes.has(62), false)
@@ -320,6 +336,25 @@ async function testSendValidationAndQueue() {
   assert.equal(context.WebMidiAudioShim.getInstalledWebMidiAudioShim().synth.channels[0].activeNotes.get(60).length, 1)
   output.clear()
   assert.equal(output.queue.length, 0)
+}
+
+async function testMasterGainControls() {
+  const context = loadBundle()
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  const shim = context.WebMidiAudioShim.getInstalledWebMidiAudioShim()
+  const access = await context.navigator.requestMIDIAccess()
+  const output = outputFrom(access)
+
+  assert.equal(shim.getMasterGain(), 0.3)
+  assert.equal(shim.setMasterGain(0.18), 0.18)
+  await output.preload()
+  assert.equal(output.synth.getMasterGain(), 0.18)
+  assert.equal(output.synth.masterGain.gain.value, 0.18)
+  assert.equal(output.synth.limiter.threshold.value, -8)
+
+  assert.equal(shim.setMasterGain(2), 1.5)
+  assert.equal(output.synth.masterGain.gain.value, 1.5)
+  assert.equal(shim.setMasterGain("bad"), 1.5)
 }
 
 async function testDeferredSendWhileSoundFontDownloads() {
@@ -473,6 +508,7 @@ async function testEmbeddedSoundFontStillLoads() {
 
 await testAccessAndPortState()
 await testSendValidationAndQueue()
+await testMasterGainControls()
 await testDeferredSendWhileSoundFontDownloads()
 await testIndexedDbSoundFontCache()
 await testCustomSoundFontDevices()

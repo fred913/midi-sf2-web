@@ -3,10 +3,12 @@ const DEFAULT_SOUNDFONT_URL = "https://raw.githubusercontent.com/fred913/midi-sf
 const DEFAULT_SOUNDFONT_CACHE_KEY = "GeneralUser-GS-v2.0.3";
 const SOUNDFONT_CACHE_DB = "midi-sf2-web";
 const SOUNDFONT_CACHE_STORE = "soundfonts";
+const SOUNDFONT_SETTINGS_KEY = "__settings__";
 const CUSTOM_SOUNDFONT_PREFIX = "custom-sf2-";
 const MIDI_CHANNELS = 16;
 const PERCUSSION_CHANNEL = 9;
 const DEFAULT_PITCH_BEND_RANGE = 2;
+const DEFAULT_MASTER_GAIN = 0.3;
 const DEFAULT_LOOKAHEAD_MS = 120;
 const DEFAULT_SCHEDULER_INTERVAL_MS = 25;
 const MIN_LOOKAHEAD_MS = 10;
@@ -77,6 +79,7 @@ export function installWebMidiAudioShim(options = {}) {
   }
 
   const previousRequestMIDIAccess = targetNavigator.requestMIDIAccess;
+  let masterGainValue = normalizeMasterGain(options.masterGain, DEFAULT_MASTER_GAIN);
   const defaultSynth = new EmbeddedSoundFontSynth({
     audioContext: options.audioContext,
     soundFontBase64: options.soundFontBase64,
@@ -84,7 +87,7 @@ export function installWebMidiAudioShim(options = {}) {
     soundFontCacheKey: options.soundFontCacheKey,
     cacheSoundFont: options.cacheSoundFont,
     progress: options.progress,
-    masterGain: options.masterGain
+    masterGain: masterGainValue
   });
   const defaultDevice = {
     id: options.outputId || DEFAULT_OUTPUT_ID,
@@ -134,7 +137,7 @@ export function installWebMidiAudioShim(options = {}) {
         soundFontCacheKey: record.key,
         cacheSoundFont: true,
         progress: options.progress === false ? false : null,
-        masterGain: options.masterGain
+        masterGain: masterGainValue
       })
     };
     devices.set(device.id, device);
@@ -158,6 +161,17 @@ export function installWebMidiAudioShim(options = {}) {
 
   function requestMIDIAccess(requestOptions = {}) {
     return Promise.resolve(getAccess(requestOptions));
+  }
+
+  function applyMasterGain(value, persist = true) {
+    masterGainValue = normalizeMasterGain(value, masterGainValue);
+    for (const device of devices.values()) {
+      device.synth.setMasterGain(masterGainValue);
+    }
+    if (persist) {
+      writeSoundFontSettings({ masterGain: masterGainValue });
+    }
+    return masterGainValue;
   }
 
   defineRequestMIDIAccess(targetNavigator, requestMIDIAccess);
@@ -187,6 +201,12 @@ export function installWebMidiAudioShim(options = {}) {
     },
     clearSoundFontCache() {
       return defaultSynth.clearCache();
+    },
+    getMasterGain() {
+      return masterGainValue;
+    },
+    setMasterGain(value) {
+      return applyMasterGain(value);
     },
     listSoundFontDevices() {
       return orderedDevices().map((device) => publicSoundFontDevice(device));
@@ -245,10 +265,16 @@ export function installWebMidiAudioShim(options = {}) {
     }
   };
 
-  loadInstalledSoundFontRecords()
-    .then((records) => {
+  Promise.all([
+    loadInstalledSoundFontRecords(),
+    options.masterGain === undefined ? readSoundFontSettings() : Promise.resolve({})
+  ])
+    .then(([records, settings]) => {
       for (const record of records) {
         registerCustomSoundFont(record);
+      }
+      if (options.masterGain === undefined && settings?.masterGain != null) {
+        applyMasterGain(settings.masterGain, false);
       }
     })
     .catch(() => {
@@ -765,12 +791,13 @@ class EmbeddedSoundFontSynth {
     this.cacheSoundFont = options.cacheSoundFont !== false;
     this.progress = options.progress === false ? null : options.progress || null;
     this.audioContext = options.audioContext || null;
-    this.masterGainValue = options.masterGain ?? 0.85;
+    this.masterGainValue = normalizeMasterGain(options.masterGain, DEFAULT_MASTER_GAIN);
     this.soundFont = null;
     this.soundFontPromise = null;
     this.pendingMidi = [];
     this.pendingMidiFlushAttached = false;
     this.masterGain = null;
+    this.limiter = null;
     this.sampleBufferCache = new Map();
     this.maxVoices = positiveIntegerOrDefault(options.maxVoices, DEFAULT_MAX_VOICES);
     this.maxVoicesPerChannel = positiveIntegerOrDefault(options.maxVoicesPerChannel, DEFAULT_MAX_VOICES_PER_CHANNEL);
@@ -1477,7 +1504,18 @@ class EmbeddedSoundFontSynth {
     if (!this.masterGain) {
       this.masterGain = this.audioContext.createGain();
       this.masterGain.gain.value = this.masterGainValue;
-      this.masterGain.connect(this.audioContext.destination);
+      if (typeof this.audioContext.createDynamicsCompressor === "function") {
+        this.limiter = this.audioContext.createDynamicsCompressor();
+        setCompressorParam(this.limiter.threshold, -8);
+        setCompressorParam(this.limiter.knee, 18);
+        setCompressorParam(this.limiter.ratio, 10);
+        setCompressorParam(this.limiter.attack, 0.003);
+        setCompressorParam(this.limiter.release, 0.12);
+        this.masterGain.connect(this.limiter);
+        this.limiter.connect(this.audioContext.destination);
+      } else {
+        this.masterGain.connect(this.audioContext.destination);
+      }
     }
 
     if (this.audioContext.state === "suspended") {
@@ -1485,6 +1523,18 @@ class EmbeddedSoundFontSynth {
     }
 
     return this.audioContext;
+  }
+
+  getMasterGain() {
+    return this.masterGainValue;
+  }
+
+  setMasterGain(value) {
+    this.masterGainValue = normalizeMasterGain(value, this.masterGainValue);
+    if (this.masterGain?.gain && this.audioContext) {
+      setAudioParam(this.masterGain.gain, this.masterGainValue, this.audioContext.currentTime || 0);
+    }
+    return this.masterGainValue;
   }
 
   ensureSoundFont() {
@@ -2263,6 +2313,43 @@ async function loadInstalledSoundFontRecords() {
   }
 }
 
+async function readSoundFontSettings() {
+  const db = await openSoundFontCache();
+  if (!db) {
+    return {};
+  }
+  try {
+    const record = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).get(SOUNDFONT_SETTINGS_KEY));
+    return record?.settings || {};
+  } catch {
+    return {};
+  } finally {
+    db.close?.();
+  }
+}
+
+async function writeSoundFontSettings(settings) {
+  const db = await openSoundFontCache();
+  if (!db) {
+    return;
+  }
+  try {
+    const existing = await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readonly").objectStore(SOUNDFONT_CACHE_STORE).get(SOUNDFONT_SETTINGS_KEY));
+    await idbRequestToPromise(db.transaction(SOUNDFONT_CACHE_STORE, "readwrite").objectStore(SOUNDFONT_CACHE_STORE).put({
+      key: SOUNDFONT_SETTINGS_KEY,
+      settings: {
+        ...(existing?.settings || {}),
+        ...settings
+      },
+      updatedAt: Date.now()
+    }));
+  } catch {
+    // User settings are a convenience; MIDI output still works without them.
+  } finally {
+    db.close?.();
+  }
+}
+
 async function writeCachedSoundFont(key, arrayBuffer, metadata = {}) {
   const db = await openSoundFontCache();
   if (!db) {
@@ -2519,6 +2606,38 @@ function openSoundFontSettingsPanel(shim) {
   closeButton.addEventListener("click", () => host.remove());
   titleRow.append(title, closeButton);
 
+  const gainRow = document.createElement("label");
+  gainRow.style.cssText = [
+    "display:grid",
+    "grid-template-columns:auto minmax(160px,1fr) 48px",
+    "gap:10px",
+    "align-items:center",
+    "margin-bottom:14px",
+    "font-size:13px"
+  ].join(";");
+  const gainLabel = document.createElement("span");
+  gainLabel.textContent = "Output gain";
+  const gainInput = document.createElement("input");
+  gainInput.type = "range";
+  gainInput.min = "0";
+  gainInput.max = "1";
+  gainInput.step = "0.01";
+  gainInput.value = String(shim.getMasterGain());
+  const gainValue = document.createElement("span");
+  gainValue.style.cssText = "text-align:right;color:#475569;font-variant-numeric:tabular-nums";
+
+  function refreshGainValue() {
+    gainValue.textContent = `${Math.round(shim.getMasterGain() * 100)}%`;
+  }
+
+  gainInput.addEventListener("input", () => {
+    const nextGain = shim.setMasterGain(Number(gainInput.value));
+    gainInput.value = String(nextGain);
+    refreshGainValue();
+  });
+  refreshGainValue();
+  gainRow.append(gainLabel, gainInput, gainValue);
+
   const dropZone = document.createElement("div");
   dropZone.style.cssText = [
     "border:1px dashed #8aa0b8",
@@ -2688,7 +2807,7 @@ function openSoundFontSettingsPanel(shim) {
     }
   });
 
-  panel.append(titleRow, dropZone, selectFileButton, fileInput, urlRow, status, devicesTitle, deviceList);
+  panel.append(titleRow, gainRow, dropZone, selectFileButton, fileInput, urlRow, status, devicesTitle, deviceList);
   host.append(panel);
   document.documentElement.appendChild(host);
   refreshDevices();
@@ -2753,7 +2872,13 @@ function parseMIDIMessageSequence(data, sysexEnabled) {
     throw new TypeError("MIDIOutput.send() data must be an iterable sequence of bytes.");
   }
 
-  const bytes = Array.from(data, (value) => Number(value) & 0xff);
+  const bytes = Array.from(data, (value) => {
+    const byte = Number(value);
+    if (!Number.isInteger(byte) || byte < 0 || byte > 0xff) {
+      throw new TypeError("MIDIOutput.send() data bytes must be integers between 0x00 and 0xFF.");
+    }
+    return byte;
+  });
   if (!bytes.length) {
     throw new TypeError("MIDIOutput.send() data must contain at least one MIDI message.");
   }
@@ -2902,6 +3027,17 @@ function setAudioParam(param, value, when) {
   } else {
     param.setValueAtTime(value, when);
   }
+}
+
+function setCompressorParam(param, value) {
+  if (param && typeof param.setValueAtTime === "function") {
+    param.setValueAtTime(value, 0);
+  }
+}
+
+function normalizeMasterGain(value, fallback = DEFAULT_MASTER_GAIN) {
+  const gain = Number(value);
+  return Number.isFinite(gain) ? clamp(gain, 0, 1.5) : fallback;
 }
 
 function requiredChunk(chunks, name) {

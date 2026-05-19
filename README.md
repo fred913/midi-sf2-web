@@ -44,7 +44,7 @@ Open `http://127.0.0.1:4173/demo/index.html`, initialize the shim, then play C4 
 
 The shim implements an output-only Web MIDI surface with `MIDIAccess.sysexEnabled`, `onstatechange`, `MIDIPort.open()`, `MIDIPort.close()`, queued `MIDIOutput.send(data, timestamp)`, and `MIDIOutput.clear()`. The bundle also exposes `WebMidiAudioShim.playMidiFile(arrayBuffer)`, which uses a lookahead scheduler for Standard MIDI files and recognizes common GM/GS reset messages.
 
-Playback is capped to avoid runaway CPU on dense files: defaults are `maxVoices: 96`, `maxVoicesPerChannel: 32`, and `maxMessagesPerTick: 4096`. `playMidiFile()` also accepts `lookaheadMs`, `schedulerIntervalMs`, and `maxEventsPerTick` overrides for tuning.
+Playback is capped to avoid runaway CPU on dense files: defaults are `maxVoices: 96`, `maxVoicesPerChannel: 32`, and `maxMessagesPerTick: 4096`. `playMidiFile()` also accepts `lookaheadMs`, `schedulerIntervalMs`, and `maxEventsPerTick` overrides for tuning. Output gain defaults to `0.3` with a Web Audio limiter; it can be changed from `SF2 Settings` or with `WebMidiAudioShim.getInstalledWebMidiAudioShim().setMasterGain(value)`.
 
 The SoundFont cache can be cleared with `WebMidiAudioShim.clearSoundFontCache()` or `WebMidiAudioShim.getInstalledWebMidiAudioShim().clearSoundFontCache()`.
 
