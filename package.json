@@ -1,6 +1,6 @@
 {
   "name": "midi-sf2-web",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "private": true,
   "type": "module",
   "description": "Web MIDI API override backed by a cached SF2 SoundFont and Web Audio.",
