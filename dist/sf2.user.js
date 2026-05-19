@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SF2 as MIDI out
 // @namespace    http://tampermonkey.net/
-// @version      0.1.5
+// @version      0.1.6
 // @description  try to take over the world!
 // @author       Sheng Fan
 // @match        *://*/*
