@@ -2,6 +2,7 @@ import {
   DEFAULT_MASTER_GAIN,
   DEFAULT_MAX_VOICES,
   DEFAULT_MAX_VOICES_PER_CHANNEL,
+  DEFAULT_PERFORMANCE_LIMIT_ENABLED,
   DEFAULT_PITCH_BEND_RANGE,
   DEFAULT_SOUNDFONT_CACHE_KEY,
   DEFAULT_SOUNDFONT_URL,
@@ -45,6 +46,7 @@ export class EmbeddedSoundFontSynth {
     this.performanceStats = createPerformanceStats();
     this.maxVoices = positiveIntegerOrDefault(options.maxVoices, DEFAULT_MAX_VOICES);
     this.maxVoicesPerChannel = positiveIntegerOrDefault(options.maxVoicesPerChannel, DEFAULT_MAX_VOICES_PER_CHANNEL);
+    this.performanceLimitEnabled = options.performanceLimitEnabled === undefined ? DEFAULT_PERFORMANCE_LIMIT_ENABLED : !!options.performanceLimitEnabled;
     this.channels = Array.from({ length: MIDI_CHANNELS }, (_, index) => createChannelState(index));
   }
 
@@ -253,7 +255,9 @@ export class EmbeddedSoundFontSynth {
       channel.activeVoices.add(voice);
     }
     this.recordPlayedNotes(1);
-    this.recordDroppedNotes(this.enforceVoiceLimits(channel, startTime));
+    if (this.performanceLimitEnabled) {
+      this.recordDroppedNotes(this.enforceVoiceLimits(channel, startTime));
+    }
   }
 
   noteOff(channelIndex, note, delaySeconds = 0) {
@@ -551,6 +555,21 @@ export class EmbeddedSoundFontSynth {
   }
 
   enforceVoiceLimits(channel, when) {
+    let dropped = this.enforceChannelVoiceLimit(channel, when);
+    dropped += this.enforceGlobalVoiceLimit(when);
+    return dropped;
+  }
+
+  enforceCurrentVoiceLimits(when) {
+    let dropped = 0;
+    for (const channel of this.channels) {
+      dropped += this.enforceChannelVoiceLimit(channel, when);
+    }
+    dropped += this.enforceGlobalVoiceLimit(when);
+    return dropped;
+  }
+
+  enforceChannelVoiceLimit(channel, when) {
     let dropped = 0;
     while (countManagedVoices(channel.activeVoices) > this.maxVoicesPerChannel) {
       const voice = selectVoiceToStop(channel.activeVoices);
@@ -560,7 +579,11 @@ export class EmbeddedSoundFontSynth {
       voice.release(when, true);
       dropped += 1;
     }
+    return dropped;
+  }
 
+  enforceGlobalVoiceLimit(when) {
+    let dropped = 0;
     while (this.countManagedVoices() > this.maxVoices) {
       const voice = this.selectGlobalVoiceToStop();
       if (!voice) {
@@ -838,6 +861,18 @@ export class EmbeddedSoundFontSynth {
       this.maxVoices = this.maxVoicesPerChannel;
     }
     return this.getVoiceLimits();
+  }
+
+  getPerformanceLimitEnabled() {
+    return this.performanceLimitEnabled;
+  }
+
+  setPerformanceLimitEnabled(enabled) {
+    this.performanceLimitEnabled = !!enabled;
+    if (this.performanceLimitEnabled && this.audioContext) {
+      this.recordDroppedNotes(this.enforceCurrentVoiceLimits(this.audioContext.currentTime || 0));
+    }
+    return this.performanceLimitEnabled;
   }
 
   ensureSoundFont() {

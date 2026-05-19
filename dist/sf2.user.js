@@ -34,6 +34,7 @@ var WebMidiAudioShim = (function (exports) {
   const DEFAULT_MAX_MESSAGES_PER_TICK = 4096;
   const DEFAULT_MAX_VOICES = 512;
   const DEFAULT_MAX_VOICES_PER_CHANNEL = 256;
+  const DEFAULT_PERFORMANCE_LIMIT_ENABLED = false;
   const GM_SYSTEM_ON = [0xf0, 0x7e, null, 0x09, 0x01, 0xf7];
   const GM2_SYSTEM_ON = [0xf0, 0x7e, null, 0x09, 0x03, 0xf7];
   const GS_RESET_PREFIX = [0xf0, 0x41, null, 0x42, 0x12, 0x40, 0x00, 0x7f, 0x00];
@@ -1401,6 +1402,22 @@ var WebMidiAudioShim = (function (exports) {
     });
     passthroughRow.append(passthroughInput, passthroughLabel);
 
+    const performanceLimitRow = document.createElement("label");
+    performanceLimitRow.style.cssText = [
+      "display:flex",
+      "align-items:center",
+      "gap:8px",
+      "margin-bottom:10px",
+      "font-size:13px",
+      "cursor:pointer"
+    ].join(";");
+    const performanceLimitInput = document.createElement("input");
+    performanceLimitInput.type = "checkbox";
+    performanceLimitInput.checked = shim.getPerformanceLimitEnabled();
+    const performanceLimitLabel = document.createElement("span");
+    performanceLimitLabel.textContent = "Enable performance limit";
+    performanceLimitRow.append(performanceLimitInput, performanceLimitLabel);
+
     const voiceLimitsRow = document.createElement("div");
     voiceLimitsRow.style.cssText = [
       "display:grid",
@@ -1410,6 +1427,21 @@ var WebMidiAudioShim = (function (exports) {
     ].join(";");
     const maxVoicesInput = createNumberSettingInput("Max voices", shim.getVoiceLimits().maxVoices, 8, 512);
     const maxVoicesPerChannelInput = createNumberSettingInput("Per channel", shim.getVoiceLimits().maxVoicesPerChannel, 4, 256);
+
+    function refreshVoiceLimitControls() {
+      const enabled = shim.getPerformanceLimitEnabled();
+      performanceLimitInput.checked = enabled;
+      maxVoicesInput.input.disabled = !enabled;
+      maxVoicesPerChannelInput.input.disabled = !enabled;
+      voiceLimitsRow.style.opacity = enabled ? "1" : "0.55";
+    }
+
+    performanceLimitInput.addEventListener("change", () => {
+      shim.setPerformanceLimitEnabled(performanceLimitInput.checked);
+      refreshVoiceLimitControls();
+      setStatus(performanceLimitInput.checked ? "Performance limit enabled" : "Performance limit disabled");
+      refreshPerformanceStats();
+    });
 
     async function applyVoiceLimitInputs() {
       const limits = shim.setVoiceLimits({
@@ -1425,6 +1457,7 @@ var WebMidiAudioShim = (function (exports) {
     maxVoicesInput.input.addEventListener("change", applyVoiceLimitInputs);
     maxVoicesPerChannelInput.input.addEventListener("change", applyVoiceLimitInputs);
     voiceLimitsRow.append(maxVoicesInput.label, maxVoicesPerChannelInput.label);
+    refreshVoiceLimitControls();
 
     const performanceSection = document.createElement("div");
     performanceSection.style.cssText = [
@@ -1680,7 +1713,7 @@ var WebMidiAudioShim = (function (exports) {
       }
     });
 
-    panel.append(titleRow, gainRow, passthroughRow, voiceLimitsRow, performanceSection, dropZone, selectFileButton, fileInput, urlRow, status, devicesTitle, deviceList);
+    panel.append(titleRow, gainRow, passthroughRow, performanceLimitRow, voiceLimitsRow, performanceSection, dropZone, selectFileButton, fileInput, urlRow, status, devicesTitle, deviceList);
     host.append(panel);
     document.documentElement.appendChild(host);
     refreshDevices();
@@ -1788,6 +1821,7 @@ var WebMidiAudioShim = (function (exports) {
       this.performanceStats = createPerformanceStats();
       this.maxVoices = positiveIntegerOrDefault(options.maxVoices, DEFAULT_MAX_VOICES);
       this.maxVoicesPerChannel = positiveIntegerOrDefault(options.maxVoicesPerChannel, DEFAULT_MAX_VOICES_PER_CHANNEL);
+      this.performanceLimitEnabled = options.performanceLimitEnabled === undefined ? DEFAULT_PERFORMANCE_LIMIT_ENABLED : !!options.performanceLimitEnabled;
       this.channels = Array.from({ length: MIDI_CHANNELS }, (_, index) => createChannelState(index));
     }
 
@@ -1996,7 +2030,9 @@ var WebMidiAudioShim = (function (exports) {
         channel.activeVoices.add(voice);
       }
       this.recordPlayedNotes(1);
-      this.recordDroppedNotes(this.enforceVoiceLimits(channel, startTime));
+      if (this.performanceLimitEnabled) {
+        this.recordDroppedNotes(this.enforceVoiceLimits(channel, startTime));
+      }
     }
 
     noteOff(channelIndex, note, delaySeconds = 0) {
@@ -2294,6 +2330,21 @@ var WebMidiAudioShim = (function (exports) {
     }
 
     enforceVoiceLimits(channel, when) {
+      let dropped = this.enforceChannelVoiceLimit(channel, when);
+      dropped += this.enforceGlobalVoiceLimit(when);
+      return dropped;
+    }
+
+    enforceCurrentVoiceLimits(when) {
+      let dropped = 0;
+      for (const channel of this.channels) {
+        dropped += this.enforceChannelVoiceLimit(channel, when);
+      }
+      dropped += this.enforceGlobalVoiceLimit(when);
+      return dropped;
+    }
+
+    enforceChannelVoiceLimit(channel, when) {
       let dropped = 0;
       while (countManagedVoices(channel.activeVoices) > this.maxVoicesPerChannel) {
         const voice = selectVoiceToStop(channel.activeVoices);
@@ -2303,7 +2354,11 @@ var WebMidiAudioShim = (function (exports) {
         voice.release(when, true);
         dropped += 1;
       }
+      return dropped;
+    }
 
+    enforceGlobalVoiceLimit(when) {
+      let dropped = 0;
       while (this.countManagedVoices() > this.maxVoices) {
         const voice = this.selectGlobalVoiceToStop();
         if (!voice) {
@@ -2581,6 +2636,18 @@ var WebMidiAudioShim = (function (exports) {
         this.maxVoices = this.maxVoicesPerChannel;
       }
       return this.getVoiceLimits();
+    }
+
+    getPerformanceLimitEnabled() {
+      return this.performanceLimitEnabled;
+    }
+
+    setPerformanceLimitEnabled(enabled) {
+      this.performanceLimitEnabled = !!enabled;
+      if (this.performanceLimitEnabled && this.audioContext) {
+        this.recordDroppedNotes(this.enforceCurrentVoiceLimits(this.audioContext.currentTime || 0));
+      }
+      return this.performanceLimitEnabled;
     }
 
     ensureSoundFont() {
@@ -3281,6 +3348,7 @@ var WebMidiAudioShim = (function (exports) {
     let passthroughRealMidi = options.passthroughRealMidi !== false;
     let maxVoicesValue = normalizeVoiceLimit(options.maxVoices, DEFAULT_MAX_VOICES, 8, 512);
     let maxVoicesPerChannelValue = normalizeVoiceLimit(options.maxVoicesPerChannel, DEFAULT_MAX_VOICES_PER_CHANNEL, 4, 256);
+    let performanceLimitEnabled = options.performanceLimitEnabled === undefined ? DEFAULT_PERFORMANCE_LIMIT_ENABLED : !!options.performanceLimitEnabled;
     maxVoicesValue = Math.max(maxVoicesValue, maxVoicesPerChannelValue);
     const defaultSynth = new EmbeddedSoundFontSynth({
       audioContext: options.audioContext,
@@ -3291,7 +3359,8 @@ var WebMidiAudioShim = (function (exports) {
       progress: options.progress,
       masterGain: masterGainValue,
       maxVoices: maxVoicesValue,
-      maxVoicesPerChannel: maxVoicesPerChannelValue
+      maxVoicesPerChannel: maxVoicesPerChannelValue,
+      performanceLimitEnabled
     });
     const defaultDevice = {
       id: options.outputId || DEFAULT_OUTPUT_ID,
@@ -3346,7 +3415,8 @@ var WebMidiAudioShim = (function (exports) {
           progress: options.progress === false ? false : null,
           masterGain: masterGainValue,
           maxVoices: maxVoicesValue,
-          maxVoicesPerChannel: maxVoicesPerChannelValue
+          maxVoicesPerChannel: maxVoicesPerChannelValue,
+          performanceLimitEnabled
         })
       };
       devices.set(device.id, device);
@@ -3421,6 +3491,17 @@ var WebMidiAudioShim = (function (exports) {
         maxVoices: maxVoicesValue,
         maxVoicesPerChannel: maxVoicesPerChannelValue
       };
+    }
+
+    function applyPerformanceLimitEnabled(enabled, persist = true) {
+      performanceLimitEnabled = !!enabled;
+      for (const device of devices.values()) {
+        device.synth.setPerformanceLimitEnabled(performanceLimitEnabled);
+      }
+      if (persist) {
+        writeSoundFontSettings({ performanceLimitEnabled });
+      }
+      return performanceLimitEnabled;
     }
 
     async function syncAllNativeMIDIAccesses() {
@@ -3505,6 +3586,12 @@ var WebMidiAudioShim = (function (exports) {
       setVoiceLimits(limits) {
         return applyVoiceLimits(limits);
       },
+      getPerformanceLimitEnabled() {
+        return performanceLimitEnabled;
+      },
+      setPerformanceLimitEnabled(enabled) {
+        return applyPerformanceLimitEnabled(enabled);
+      },
       getPerformanceStats() {
         return aggregatePerformanceStats(orderedDevices());
       },
@@ -3565,9 +3652,15 @@ var WebMidiAudioShim = (function (exports) {
       }
     };
 
+    const shouldReadSettings = options.masterGain === undefined ||
+      options.passthroughRealMidi === undefined ||
+      options.maxVoices === undefined ||
+      options.maxVoicesPerChannel === undefined ||
+      options.performanceLimitEnabled === undefined;
+
     settingsReady = Promise.all([
       loadInstalledSoundFontRecords(),
-      options.masterGain === undefined ? readSoundFontSettings() : Promise.resolve({})
+      shouldReadSettings ? readSoundFontSettings() : Promise.resolve({})
     ])
       .then(([records, settings]) => {
         for (const record of records) {
@@ -3584,6 +3677,9 @@ var WebMidiAudioShim = (function (exports) {
             maxVoices: options.maxVoices === undefined ? settings?.maxVoices : maxVoicesValue,
             maxVoicesPerChannel: options.maxVoicesPerChannel === undefined ? settings?.maxVoicesPerChannel : maxVoicesPerChannelValue
           }, false);
+        }
+        if (options.performanceLimitEnabled === undefined && settings?.performanceLimitEnabled != null) {
+          applyPerformanceLimitEnabled(settings.performanceLimitEnabled, false);
         }
       })
       .catch(() => {

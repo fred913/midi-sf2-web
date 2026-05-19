@@ -241,6 +241,22 @@ export function openSoundFontSettingsPanel(shim) {
   });
   passthroughRow.append(passthroughInput, passthroughLabel);
 
+  const performanceLimitRow = document.createElement("label");
+  performanceLimitRow.style.cssText = [
+    "display:flex",
+    "align-items:center",
+    "gap:8px",
+    "margin-bottom:10px",
+    "font-size:13px",
+    "cursor:pointer"
+  ].join(";");
+  const performanceLimitInput = document.createElement("input");
+  performanceLimitInput.type = "checkbox";
+  performanceLimitInput.checked = shim.getPerformanceLimitEnabled();
+  const performanceLimitLabel = document.createElement("span");
+  performanceLimitLabel.textContent = "Enable performance limit";
+  performanceLimitRow.append(performanceLimitInput, performanceLimitLabel);
+
   const voiceLimitsRow = document.createElement("div");
   voiceLimitsRow.style.cssText = [
     "display:grid",
@@ -250,6 +266,21 @@ export function openSoundFontSettingsPanel(shim) {
   ].join(";");
   const maxVoicesInput = createNumberSettingInput("Max voices", shim.getVoiceLimits().maxVoices, 8, 512);
   const maxVoicesPerChannelInput = createNumberSettingInput("Per channel", shim.getVoiceLimits().maxVoicesPerChannel, 4, 256);
+
+  function refreshVoiceLimitControls() {
+    const enabled = shim.getPerformanceLimitEnabled();
+    performanceLimitInput.checked = enabled;
+    maxVoicesInput.input.disabled = !enabled;
+    maxVoicesPerChannelInput.input.disabled = !enabled;
+    voiceLimitsRow.style.opacity = enabled ? "1" : "0.55";
+  }
+
+  performanceLimitInput.addEventListener("change", () => {
+    shim.setPerformanceLimitEnabled(performanceLimitInput.checked);
+    refreshVoiceLimitControls();
+    setStatus(performanceLimitInput.checked ? "Performance limit enabled" : "Performance limit disabled");
+    refreshPerformanceStats();
+  });
 
   async function applyVoiceLimitInputs() {
     const limits = shim.setVoiceLimits({
@@ -265,6 +296,7 @@ export function openSoundFontSettingsPanel(shim) {
   maxVoicesInput.input.addEventListener("change", applyVoiceLimitInputs);
   maxVoicesPerChannelInput.input.addEventListener("change", applyVoiceLimitInputs);
   voiceLimitsRow.append(maxVoicesInput.label, maxVoicesPerChannelInput.label);
+  refreshVoiceLimitControls();
 
   const performanceSection = document.createElement("div");
   performanceSection.style.cssText = [
@@ -520,7 +552,7 @@ export function openSoundFontSettingsPanel(shim) {
     }
   });
 
-  panel.append(titleRow, gainRow, passthroughRow, voiceLimitsRow, performanceSection, dropZone, selectFileButton, fileInput, urlRow, status, devicesTitle, deviceList);
+  panel.append(titleRow, gainRow, passthroughRow, performanceLimitRow, voiceLimitsRow, performanceSection, dropZone, selectFileButton, fileInput, urlRow, status, devicesTitle, deviceList);
   host.append(panel);
   document.documentElement.appendChild(host);
   refreshDevices();

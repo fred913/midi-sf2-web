@@ -5,6 +5,7 @@ import {
   DEFAULT_MAX_VOICES,
   DEFAULT_MAX_VOICES_PER_CHANNEL,
   DEFAULT_OUTPUT_ID,
+  DEFAULT_PERFORMANCE_LIMIT_ENABLED,
   DEFAULT_SCHEDULER_INTERVAL_MS,
   DEFAULT_SOUNDFONT_CACHE_KEY,
   MIN_LOOKAHEAD_MS,
@@ -65,6 +66,7 @@ export function installWebMidiAudioShim(options = {}) {
   let passthroughRealMidi = options.passthroughRealMidi !== false;
   let maxVoicesValue = normalizeVoiceLimit(options.maxVoices, DEFAULT_MAX_VOICES, 8, 512);
   let maxVoicesPerChannelValue = normalizeVoiceLimit(options.maxVoicesPerChannel, DEFAULT_MAX_VOICES_PER_CHANNEL, 4, 256);
+  let performanceLimitEnabled = options.performanceLimitEnabled === undefined ? DEFAULT_PERFORMANCE_LIMIT_ENABLED : !!options.performanceLimitEnabled;
   maxVoicesValue = Math.max(maxVoicesValue, maxVoicesPerChannelValue);
   const defaultSynth = new EmbeddedSoundFontSynth({
     audioContext: options.audioContext,
@@ -75,7 +77,8 @@ export function installWebMidiAudioShim(options = {}) {
     progress: options.progress,
     masterGain: masterGainValue,
     maxVoices: maxVoicesValue,
-    maxVoicesPerChannel: maxVoicesPerChannelValue
+    maxVoicesPerChannel: maxVoicesPerChannelValue,
+    performanceLimitEnabled
   });
   const defaultDevice = {
     id: options.outputId || DEFAULT_OUTPUT_ID,
@@ -130,7 +133,8 @@ export function installWebMidiAudioShim(options = {}) {
         progress: options.progress === false ? false : null,
         masterGain: masterGainValue,
         maxVoices: maxVoicesValue,
-        maxVoicesPerChannel: maxVoicesPerChannelValue
+        maxVoicesPerChannel: maxVoicesPerChannelValue,
+        performanceLimitEnabled
       })
     };
     devices.set(device.id, device);
@@ -205,6 +209,17 @@ export function installWebMidiAudioShim(options = {}) {
       maxVoices: maxVoicesValue,
       maxVoicesPerChannel: maxVoicesPerChannelValue
     };
+  }
+
+  function applyPerformanceLimitEnabled(enabled, persist = true) {
+    performanceLimitEnabled = !!enabled;
+    for (const device of devices.values()) {
+      device.synth.setPerformanceLimitEnabled(performanceLimitEnabled);
+    }
+    if (persist) {
+      writeSoundFontSettings({ performanceLimitEnabled });
+    }
+    return performanceLimitEnabled;
   }
 
   async function syncAllNativeMIDIAccesses() {
@@ -289,6 +304,12 @@ export function installWebMidiAudioShim(options = {}) {
     setVoiceLimits(limits) {
       return applyVoiceLimits(limits);
     },
+    getPerformanceLimitEnabled() {
+      return performanceLimitEnabled;
+    },
+    setPerformanceLimitEnabled(enabled) {
+      return applyPerformanceLimitEnabled(enabled);
+    },
     getPerformanceStats() {
       return aggregatePerformanceStats(orderedDevices());
     },
@@ -349,9 +370,15 @@ export function installWebMidiAudioShim(options = {}) {
     }
   };
 
+  const shouldReadSettings = options.masterGain === undefined ||
+    options.passthroughRealMidi === undefined ||
+    options.maxVoices === undefined ||
+    options.maxVoicesPerChannel === undefined ||
+    options.performanceLimitEnabled === undefined;
+
   settingsReady = Promise.all([
     loadInstalledSoundFontRecords(),
-    options.masterGain === undefined ? readSoundFontSettings() : Promise.resolve({})
+    shouldReadSettings ? readSoundFontSettings() : Promise.resolve({})
   ])
     .then(([records, settings]) => {
       for (const record of records) {
@@ -368,6 +395,9 @@ export function installWebMidiAudioShim(options = {}) {
           maxVoices: options.maxVoices === undefined ? settings?.maxVoices : maxVoicesValue,
           maxVoicesPerChannel: options.maxVoicesPerChannel === undefined ? settings?.maxVoicesPerChannel : maxVoicesPerChannelValue
         }, false);
+      }
+      if (options.performanceLimitEnabled === undefined && settings?.performanceLimitEnabled != null) {
+        applyPerformanceLimitEnabled(settings.performanceLimitEnabled, false);
       }
     })
     .catch(() => {

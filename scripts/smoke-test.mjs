@@ -432,6 +432,8 @@ async function testVoiceLimitControls() {
   let limits = shim.getVoiceLimits()
   assert.equal(limits.maxVoices, 512)
   assert.equal(limits.maxVoicesPerChannel, 256)
+  assert.equal(shim.getPerformanceLimitEnabled(), false)
+  assert.equal(output.synth.getPerformanceLimitEnabled(), false)
 
   limits = shim.setVoiceLimits({ maxVoices: 16, maxVoicesPerChannel: 9 })
   assert.equal(limits.maxVoices, 16)
@@ -442,6 +444,11 @@ async function testVoiceLimitControls() {
   limits = shim.setVoiceLimits({ maxVoices: 2, maxVoicesPerChannel: 999 })
   assert.equal(limits.maxVoices, 256)
   assert.equal(limits.maxVoicesPerChannel, 256)
+
+  assert.equal(shim.setPerformanceLimitEnabled(true), true)
+  assert.equal(shim.getPerformanceLimitEnabled(), true)
+  assert.equal(output.synth.getPerformanceLimitEnabled(), true)
+  assert.equal(shim.setPerformanceLimitEnabled(false), false)
 }
 
 async function testPerformanceStats() {
@@ -468,8 +475,8 @@ async function testPerformanceStats() {
   assert.equal(stats.totals.droppedMidiEvents, 1)
   assert.equal(stats.devices[0].stats.activeVoices, 1)
 
-  output.synth.maxVoices = 4
-  output.synth.maxVoicesPerChannel = 4
+  shim.setPerformanceLimitEnabled(true)
+  shim.setVoiceLimits({ maxVoices: 4, maxVoicesPerChannel: 4 })
   for (let i = 0; i < 7; i += 1) {
     output.send([0x90, 62 + i, 100])
   }
@@ -499,7 +506,25 @@ async function testDefaultLimitsAllowDenseNoteBursts() {
   assert.equal(stats.totals.playedNotes, 200)
   assert.equal(stats.totals.droppedNotes, 0)
   assert.ok(stats.totals.activeVoices >= 200)
-  assert.ok(stats.totals.activeVoices <= 256)
+}
+
+async function testPerformanceLimitsDefaultOff() {
+  const context = loadBundle()
+  const access = await context.navigator.requestMIDIAccess()
+  const output = outputFrom(access)
+  const shim = context.WebMidiAudioShim.getInstalledWebMidiAudioShim()
+  await output.preload()
+
+  shim.setVoiceLimits({ maxVoices: 8, maxVoicesPerChannel: 4 })
+  for (let i = 0; i < 12; i += 1) {
+    output.send([0x90, 48 + i, 100])
+  }
+
+  const stats = shim.getPerformanceStats()
+  assert.equal(shim.getPerformanceLimitEnabled(), false)
+  assert.equal(stats.totals.playedNotes, 12)
+  assert.equal(stats.totals.droppedNotes, 0)
+  assert.ok(stats.totals.activeVoices > 8)
 }
 
 async function testDeferredSendWhileSoundFontDownloads() {
@@ -659,6 +684,7 @@ await testPassthroughRealMidiDevices()
 await testVoiceLimitControls()
 await testPerformanceStats()
 await testDefaultLimitsAllowDenseNoteBursts()
+await testPerformanceLimitsDefaultOff()
 await testDeferredSendWhileSoundFontDownloads()
 await testIndexedDbSoundFontCache()
 await testCustomSoundFontDevices()

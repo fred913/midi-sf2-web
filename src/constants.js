@@ -16,6 +16,7 @@ export const MIN_SCHEDULER_INTERVAL_MS = 8;
 export const DEFAULT_MAX_MESSAGES_PER_TICK = 4096;
 export const DEFAULT_MAX_VOICES = 512;
 export const DEFAULT_MAX_VOICES_PER_CHANNEL = 256;
+export const DEFAULT_PERFORMANCE_LIMIT_ENABLED = false;
 export const GM_SYSTEM_ON = [0xf0, 0x7e, null, 0x09, 0x01, 0xf7];
 export const GM2_SYSTEM_ON = [0xf0, 0x7e, null, 0x09, 0x03, 0xf7];
 export const GS_RESET_PREFIX = [0xf0, 0x41, null, 0x42, 0x12, 0x40, 0x00, 0x7f, 0x00];
