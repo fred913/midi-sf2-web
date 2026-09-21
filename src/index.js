@@ -29,7 +29,11 @@ import {
   writeCachedSoundFont,
   writeSoundFontSettings
 } from "./storage.js";
-import { openSoundFontSettingsPanel, registerSettingsMenu } from "./ui.js";
+import {
+  createSoundFontProgressOverlay,
+  openSoundFontSettingsPanel,
+  registerSettingsMenu
+} from "./ui.js";
 import {
   defineRequestMIDIAccess,
   firstMapValue,

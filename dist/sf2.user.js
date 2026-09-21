@@ -1161,7 +1161,7 @@ var WebMidiAudioShim = (function (exports) {
     return Object.prototype.toString.call(value) === "[object ArrayBuffer]";
   }
 
-  function createSoundFontProgressOverlay$1() {
+  function createSoundFontProgressOverlay() {
     if (typeof document === "undefined" || typeof document.createElement !== "function") {
       return noopProgress();
     }
@@ -2696,7 +2696,7 @@ var WebMidiAudioShim = (function (exports) {
         throw new Error("No cached SoundFont data is available for this MIDI output.");
       }
 
-      const progress = this.progress || createSoundFontProgressOverlay$1();
+      const progress = this.progress || createSoundFontProgressOverlay();
       this.progress = progress;
       let arrayBuffer;
       try {
