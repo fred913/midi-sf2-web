@@ -676,6 +676,51 @@ async function testEmbeddedSoundFontStillLoads() {
   assert.equal(preset.name, "Grand Piano")
 }
 
+async function testQueueBatching() {
+  const context = loadBundle()
+  const output = outputFrom(await context.navigator.requestMIDIAccess())
+  const received = []
+  output.synth.dispatchMidi = (bytes, delay) => received.push([bytes[1], delay])
+  output.maxMessagesPerTick = 2
+  output.enqueueMessage([0x90, 62, 100], 20)
+  output.enqueueMessage([0x90, 60, 100], 10)
+  output.enqueueMessage([0x90, 61, 100], 10)
+  output.enqueueMessage([0x90, 63, 100], 10000)
+  output.flushQueue()
+  assert.deepEqual(received, [[60, 0.01], [61, 0.01]])
+  assert.equal(output.queue.length, 2)
+  output.flushQueue()
+  assert.deepEqual(received[2], [62, 0.02])
+  assert.equal(output.queue.length, 1)
+  context.advanceClock(10000)
+  output.synth.dispatchMidi = () => { throw new Error("dispatch failed") }
+  assert.throws(() => output.flushQueue(), /dispatch failed/)
+  assert.equal(output.queue.length, 0)
+  output.clear()
+}
+
+async function testEndedVoiceDisconnects() {
+  const context = loadBundle()
+  const output = outputFrom(await context.navigator.requestMIDIAccess())
+  await output.preload()
+  output.send([0x90, 60, 100])
+  const voices = [...output.synth.channels[0].activeVoices]
+  assert.ok(voices.length > 0)
+  for (const voice of voices) {
+    for (const node of [voice.source, voice.gain, voice.outputGain, voice.panner]) {
+      assert.ok(node.target)
+    }
+    voice.source.onended()
+    for (const node of [voice.source, voice.gain, voice.outputGain, voice.panner]) {
+      assert.equal(node.target, null)
+    }
+  }
+  assert.equal(output.synth.channels[0].activeVoices.size, 0)
+  assert.equal(output.synth.channels[0].activeNotes.size, 0)
+}
+
+await testQueueBatching()
+await testEndedVoiceDisconnects()
 testUserscriptHeader()
 await testAccessAndPortState()
 await testSendValidationAndQueue()

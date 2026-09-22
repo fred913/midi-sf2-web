@@ -23,6 +23,7 @@ import { LookaheadScheduler } from "./scheduler.js";
 import { EmbeddedSoundFontSynth } from "./synth.js";
 import {
   deleteCachedSoundFont,
+  downloadSoundFont,
   loadInstalledSoundFontRecords,
   readSoundFontSettings,
   updateCachedSoundFontMetadata,

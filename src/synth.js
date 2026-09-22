@@ -760,6 +760,10 @@ export class EmbeddedSoundFontSynth {
     }
 
     source.onended = () => {
+      source.disconnect();
+      gain.disconnect();
+      outputGain.disconnect();
+      panner?.disconnect();
       channel.activeVoices.delete(voice);
       if (voice.lfoGain && typeof voice.lfoGain.disconnect === "function") {
         voice.lfoGain.disconnect();

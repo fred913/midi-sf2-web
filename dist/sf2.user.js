@@ -958,7 +958,7 @@ var WebMidiAudioShim = (function (exports) {
     return raw & 0x8000 ? raw - 0x10000 : raw;
   }
 
-  async function downloadSoundFont$1(url, progress) {
+  async function downloadSoundFont(url, progress) {
     const fetchFn = typeof fetch === "function" ? fetch : pageGlobalThis()?.fetch?.bind(pageGlobalThis());
     if (typeof fetchFn !== "function") {
       throw new Error("fetch() is required to download the SoundFont.");
@@ -2535,6 +2535,10 @@ var WebMidiAudioShim = (function (exports) {
       }
 
       source.onended = () => {
+        source.disconnect();
+        gain.disconnect();
+        outputGain.disconnect();
+        panner?.disconnect();
         channel.activeVoices.delete(voice);
         if (voice.lfoGain && typeof voice.lfoGain.disconnect === "function") {
           voice.lfoGain.disconnect();
@@ -2700,7 +2704,7 @@ var WebMidiAudioShim = (function (exports) {
       this.progress = progress;
       let arrayBuffer;
       try {
-        arrayBuffer = await downloadSoundFont$1(url, progress);
+        arrayBuffer = await downloadSoundFont(url, progress);
         if (this.cacheSoundFont) {
           await writeCachedSoundFont(this.soundFontCacheKey, arrayBuffer, { url });
         }
@@ -3299,11 +3303,16 @@ var WebMidiAudioShim = (function (exports) {
       const now = performanceNow();
       const horizon = now + this.lookaheadMs;
       let sent = 0;
-      while (this.queue.length && this.queue[0].timestamp <= horizon && sent < this.maxMessagesPerTick) {
-        const item = this.queue.shift();
-        const delaySeconds = Math.max(0, (item.timestamp - now) / 1000);
-        this.synth.dispatchMidi(item.bytes, delaySeconds);
-        sent += 1;
+      try {
+        while (sent < this.queue.length && this.queue[sent].timestamp <= horizon && sent < this.maxMessagesPerTick) {
+          const item = this.queue[sent];
+          sent += 1;
+          const delaySeconds = Math.max(0, (item.timestamp - now) / 1000);
+          this.synth.dispatchMidi(item.bytes, delaySeconds);
+        }
+      } finally {
+        // Remove consumed events once, including the event that threw if dispatch failed.
+        this.queue.splice(0, sent);
       }
 
       if (this.queue.length) {

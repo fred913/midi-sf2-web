@@ -288,11 +288,16 @@ class VirtualMIDIOutput extends SimpleEventTarget {
     const now = performanceNow();
     const horizon = now + this.lookaheadMs;
     let sent = 0;
-    while (this.queue.length && this.queue[0].timestamp <= horizon && sent < this.maxMessagesPerTick) {
-      const item = this.queue.shift();
-      const delaySeconds = Math.max(0, (item.timestamp - now) / 1000);
-      this.synth.dispatchMidi(item.bytes, delaySeconds);
-      sent += 1;
+    try {
+      while (sent < this.queue.length && this.queue[sent].timestamp <= horizon && sent < this.maxMessagesPerTick) {
+        const item = this.queue[sent];
+        sent += 1;
+        const delaySeconds = Math.max(0, (item.timestamp - now) / 1000);
+        this.synth.dispatchMidi(item.bytes, delaySeconds);
+      }
+    } finally {
+      // Remove consumed events once, including the event that threw if dispatch failed.
+      this.queue.splice(0, sent);
     }
 
     if (this.queue.length) {
